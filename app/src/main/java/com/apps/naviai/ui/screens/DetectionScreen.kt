@@ -3,6 +3,7 @@ package com.apps.naviai.ui.screens
 import androidx.camera.core.CameraSelector
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.background
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -15,11 +16,14 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.RemoveRedEye
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Straighten
+import androidx.compose.material.icons.filled.TextFields
 import androidx.compose.material.icons.filled.VolumeOff
 import androidx.compose.material.icons.filled.VolumeUp
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.FilledIconToggleButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -34,6 +38,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.platform.LocalContext
@@ -54,6 +59,10 @@ import com.apps.naviai.ui.components.PerformanceStatsOverlay
 import com.apps.naviai.ui.components.RiskIndicator
 import com.apps.naviai.ui.components.VoiceCommandPanel
 import com.apps.naviai.ui.viewmodel.DetectionViewModel
+import com.apps.naviai.ui.viewmodel.HazardWarningStatus
+import com.apps.naviai.ui.viewmodel.ObjectSearchStatus
+import com.apps.naviai.ui.viewmodel.SceneDescriptionStatus
+import com.apps.naviai.ui.viewmodel.TextReadingStatus
 
 @Composable
 fun DetectionScreen(
@@ -193,12 +202,161 @@ fun DetectionScreen(
                 ) {
                     Icon(Icons.Filled.Cameraswitch, contentDescription = null, tint = Color.White)
                 }
+
+                IconButton(
+                    onClick = { viewModel.describeSurroundingsManually() },
+                    enabled = uiState.sceneDescriptionStatus != SceneDescriptionStatus.Processing,
+                    modifier = Modifier.size(56.dp).semantics { contentDescription = "Describe surroundings" }
+                ) {
+                    Icon(Icons.Filled.RemoveRedEye, contentDescription = null, tint = Color.White)
+                }
+
+                IconButton(
+                    onClick = { viewModel.readTextManually() },
+                    enabled = uiState.textReadingStatus != TextReadingStatus.Processing,
+                    modifier = Modifier.size(56.dp).semantics { contentDescription = "Read text aloud" }
+                ) {
+                    Icon(Icons.Filled.TextFields, contentDescription = null, tint = Color.White)
+                }
             }
+
+            SceneDescriptionCard(uiState.sceneDescriptionStatus, modifier = Modifier.fillMaxWidth())
+            TextReadingCard(uiState.textReadingStatus, modifier = Modifier.fillMaxWidth())
+            HazardWarningCard(uiState.hazardWarningStatus, modifier = Modifier.fillMaxWidth())
+            ObjectSearchCard(uiState.objectSearchStatus, modifier = Modifier.fillMaxWidth())
 
             uiState.trackedObjects.maxByOrNull { it.riskLevel.priority }?.let { mostRelevant ->
                 Spacer(modifier = Modifier.size(16.dp))
                 DetectionInfoCard(tracked = mostRelevant, modifier = Modifier.fillMaxWidth())
             }
+        }
+    }
+}
+
+@Composable
+private fun SceneDescriptionCard(status: SceneDescriptionStatus, modifier: Modifier = Modifier) {
+    if (status == SceneDescriptionStatus.Idle) return
+
+    Spacer(modifier = Modifier.size(16.dp))
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(20.dp))
+            .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.94f))
+            .padding(16.dp)
+    ) {
+        when (status) {
+            is SceneDescriptionStatus.Processing -> Row(verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                Spacer(modifier = Modifier.size(12.dp))
+                Text("Analyzing surroundings…", style = MaterialTheme.typography.bodyMedium)
+            }
+            is SceneDescriptionStatus.Success -> Text(
+                status.text,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.primary
+            )
+            is SceneDescriptionStatus.Failure -> Text(
+                status.message,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.error
+            )
+            SceneDescriptionStatus.Idle -> Unit
+        }
+    }
+}
+
+@Composable
+private fun TextReadingCard(status: TextReadingStatus, modifier: Modifier = Modifier) {
+    if (status == TextReadingStatus.Idle) return
+
+    Spacer(modifier = Modifier.size(16.dp))
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(20.dp))
+            .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.94f))
+            .padding(16.dp)
+    ) {
+        when (status) {
+            is TextReadingStatus.Processing -> Row(verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                Spacer(modifier = Modifier.size(12.dp))
+                Text("Reading text…", style = MaterialTheme.typography.bodyMedium)
+            }
+            is TextReadingStatus.Success -> Text(
+                status.text,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.primary
+            )
+            is TextReadingStatus.Failure -> Text(
+                status.message,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.error
+            )
+            TextReadingStatus.Idle -> Unit
+        }
+    }
+}
+
+@Composable
+private fun HazardWarningCard(status: HazardWarningStatus, modifier: Modifier = Modifier) {
+    // Not shown on Failure: this feature triggers automatically (not from a
+    // user action), so a failed background check isn't surfaced as a visible
+    // error -- that would alarm/distract the user over something they never
+    // asked for. It's silently retried on the next qualifying frame instead
+    // (already logged for debugging in DetectionViewModel.checkForHazard).
+    if (status == HazardWarningStatus.Idle || status is HazardWarningStatus.Failure) return
+
+    Spacer(modifier = Modifier.size(16.dp))
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(20.dp))
+            .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.94f))
+            .padding(16.dp)
+    ) {
+        when (status) {
+            is HazardWarningStatus.Processing -> Row(verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                Spacer(modifier = Modifier.size(12.dp))
+                Text("Checking a possible obstacle…", style = MaterialTheme.typography.bodyMedium)
+            }
+            is HazardWarningStatus.Success -> Text(
+                status.text,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.error
+            )
+            else -> Unit
+        }
+    }
+}
+
+@Composable
+private fun ObjectSearchCard(status: ObjectSearchStatus, modifier: Modifier = Modifier) {
+    if (status == ObjectSearchStatus.Idle) return
+
+    Spacer(modifier = Modifier.size(16.dp))
+    Column(
+        modifier = modifier
+            .clip(RoundedCornerShape(20.dp))
+            .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.94f))
+            .padding(16.dp)
+    ) {
+        when (status) {
+            is ObjectSearchStatus.Processing -> Row(verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                Spacer(modifier = Modifier.size(12.dp))
+                Text("Searching…", style = MaterialTheme.typography.bodyMedium)
+            }
+            is ObjectSearchStatus.Success -> Text(
+                status.text,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.primary
+            )
+            is ObjectSearchStatus.Failure -> Text(
+                status.message,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.error
+            )
+            ObjectSearchStatus.Idle -> Unit
         }
     }
 }

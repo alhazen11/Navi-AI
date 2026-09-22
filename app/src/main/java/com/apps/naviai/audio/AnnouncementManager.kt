@@ -53,7 +53,7 @@ class AnnouncementManager @Inject constructor(private val tts: Speaker) {
 
         announcements.forEach { announcement ->
             onAnnounced(announcement.trackingId, nowMs)
-            tts.speak(announcement.text, announcement.isUrgent, "track_${announcement.trackingId}_$nowMs")
+            //tts.speak(announcement.text, announcement.isUrgent, "track_${announcement.trackingId}_$nowMs")
         }
 
         return announcements

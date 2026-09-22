@@ -1,6 +1,9 @@
 package com.apps.naviai.camera
 
+import android.graphics.Bitmap
+import android.graphics.Matrix
 import androidx.camera.core.ImageProxy
+import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 
 /**
@@ -60,4 +63,34 @@ object ImageUtils {
     }
 
     private fun ByteBuffer.getUnsigned(index: Int): Int = get(index).toInt() and 0xFF
+
+    /**
+     * Encodes a raw sensor-space RGBA buffer (as produced by [yuv420ToRgba])
+     * into an upright, correctly-mirrored JPEG -- i.e. the same orientation
+     * the user actually sees in the preview, matching [com.apps.naviai.detection.detector.Detection]'s
+     * upright display-space coordinates. Used for the Scene Understanding
+     * feature to hand a still frame to a vision LLM; NOT called per-frame
+     * (only when a description is actually requested), since bitmap
+     * creation + JPEG compression is too expensive to do on every frame.
+     */
+    fun rgbaToUprightJpeg(rgba: ByteArray, width: Int, height: Int, rotationDegrees: Int, mirror: Boolean, quality: Int = 80): ByteArray {
+        val source = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        source.copyPixelsFromBuffer(ByteBuffer.wrap(rgba))
+
+        val needsTransform = rotationDegrees != 0 || mirror
+        val oriented = if (needsTransform) {
+            val matrix = Matrix().apply {
+                if (rotationDegrees != 0) postRotate(rotationDegrees.toFloat())
+                if (mirror) postScale(-1f, 1f)
+            }
+            Bitmap.createBitmap(source, 0, 0, width, height, matrix, true).also { source.recycle() }
+        } else {
+            source
+        }
+
+        val out = ByteArrayOutputStream()
+        oriented.compress(Bitmap.CompressFormat.JPEG, quality, out)
+        oriented.recycle()
+        return out.toByteArray()
+    }
 }

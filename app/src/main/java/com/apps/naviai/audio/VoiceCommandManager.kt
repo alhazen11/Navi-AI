@@ -32,7 +32,16 @@ data class VoiceCommandUiState(
     /** The text following the wake word, once one was detected. Null until then. */
     val command: String? = null,
     /** A status/prompt message for the UI (e.g. asking the user to repeat), or null when none applies. */
-    val message: String? = null
+    val message: String? = null,
+    /**
+     * Monotonically increasing, set only when [status] becomes [VoiceCommandStatus.RECOGNIZED]
+     * for a *newly* recognized command. Lets a dispatcher (e.g. matching
+     * [command] against a known intent like Scene Understanding) tell a
+     * fresh recognition apart from re-collecting the same still-current
+     * state (a late [kotlinx.coroutines.flow.StateFlow] subscriber replays
+     * the current value, which is not a new event to act on).
+     */
+    val eventId: Long = 0
 )
 
 /**
@@ -68,6 +77,7 @@ class VoiceCommandManager @Inject constructor(
     private var language = AnnouncementLanguage.INDONESIAN
     private var apiKey: String? = null
     private var active = false
+    private var recognizedEventCounter = 0L
 
     /**
      * Must be called from the main thread. Idempotent while already active
@@ -141,7 +151,8 @@ class VoiceCommandManager @Inject constructor(
                 _state.value = VoiceCommandUiState(
                     status = VoiceCommandStatus.RECOGNIZED,
                     rawRecognizedText = text,
-                    command = command
+                    command = command,
+                    eventId = ++recognizedEventCounter
                 )
                 speakRecognizedCommand(command)
             }
