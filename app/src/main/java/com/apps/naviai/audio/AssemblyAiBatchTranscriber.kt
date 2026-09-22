@@ -1,0 +1,360 @@
+package com.apps.naviai.audio
+
+import android.annotation.SuppressLint
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
+import android.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.ByteArrayOutputStream
+import java.io.IOException
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.sqrt
+
+/** One outcome from a locally VAD-segmented utterance. */
+sealed interface BatchTranscriptEvent {
+    /** Mic is actively monitored for speech; nothing captured yet. */
+    data object Listening : BatchTranscriptEvent
+    /** An utterance was captured locally and is now being uploaded/transcribed. */
+    data object Transcribing : BatchTranscriptEvent
+    data class Result(val transcript: String) : BatchTranscriptEvent
+    /**
+     * @param fatal true if the mic/capture loop itself failed to start (no
+     *   further events will follow -- the caller must call [start] again to
+     *   retry); false for a single utterance's upload/transcription failing
+     *   (capture keeps running and a [Listening] event follows immediately).
+     */
+    data class Error(val message: String, val fatal: Boolean = false) : BatchTranscriptEvent
+}
+
+/**
+ * Captures microphone audio continuously, locally detects when the user has
+ * said something (simple energy-based voice activity detection) and when
+ * they've stopped, then sends *just that utterance* to AssemblyAI's
+ * pre-recorded ("async") transcription API with `language_detection: true`.
+ *
+ * This replaces a prior realtime-streaming-WebSocket implementation because
+ * AssemblyAI's realtime streaming API does not support Indonesian at all
+ * (confirmed against their docs -- `universal-streaming-multilingual`
+ * covers only English/Spanish/German/French/Portuguese/Italian, and even
+ * their best realtime model adds nowhere near full language coverage).
+ * Indonesian *is* supported on the async endpoint used here, and
+ * `language_detection` auto-picks between whichever language the user
+ * actually spoke, so English and Indonesian commands both work without the
+ * user choosing one in advance.
+ *
+ * The tradeoff is latency: each command takes roughly upload + processing
+ * time (typically one to a few seconds) to come back, instead of
+ * near-instant streaming partials. Only one utterance is in flight at a
+ * time -- local capture is effectively paused (audio keeps flowing into the
+ * device buffer but isn't read) while a prior utterance is being
+ * transcribed.
+ */
+class AssemblyAiBatchTranscriber(private val httpClient: OkHttpClient) {
+
+    private var audioRecord: AudioRecord? = null
+    private var audioJob: Job? = null
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val muted = AtomicBoolean(false)
+    private var apiKey: String? = null
+
+    /**
+     * Stops forwarding captured audio to the local VAD without tearing down
+     * the mic. Used while NAVI is speaking (TTS) so it doesn't hear itself
+     * and start "recording" its own voice as a new utterance.
+     */
+    fun setMuted(value: Boolean) {
+        muted.set(value)
+    }
+
+    /** Must hold RECORD_AUDIO; caller is responsible for the permission check. */
+    @SuppressLint("MissingPermission")
+    fun start(apiKey: String, onEvent: (BatchTranscriptEvent) -> Unit) {
+        stop()
+        this.apiKey = apiKey
+        startAudioCapture(onEvent)
+    }
+
+    fun stop() {
+        audioJob?.cancel()
+        audioJob = null
+        stopAudioRecord()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun startAudioCapture(onEvent: (BatchTranscriptEvent) -> Unit) {
+        val minBufferBytes = AudioRecord.getMinBufferSize(SAMPLE_RATE_HZ, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        if (minBufferBytes <= 0) {
+            Log.e(TAG, "AudioRecord.getMinBufferSize failed: $minBufferBytes")
+            onEvent(BatchTranscriptEvent.Error("AudioRecord unsupported on this device", fatal = true))
+            return
+        }
+        val bufferBytes = maxOf(minBufferBytes, CHUNK_BYTES * 2)
+
+        val record = AudioRecord(
+            MediaRecorder.AudioSource.VOICE_RECOGNITION,
+            SAMPLE_RATE_HZ,
+            AudioFormat.CHANNEL_IN_MONO,
+            AudioFormat.ENCODING_PCM_16BIT,
+            bufferBytes
+        )
+        if (record.state != AudioRecord.STATE_INITIALIZED) {
+            Log.e(TAG, "AudioRecord failed to initialize")
+            record.release()
+            onEvent(BatchTranscriptEvent.Error("Microphone failed to initialize", fatal = true))
+            return
+        }
+
+        audioRecord = record
+        record.startRecording()
+        onEvent(BatchTranscriptEvent.Listening)
+
+        audioJob = scope.launch {
+            val buffer = ByteArray(CHUNK_BYTES)
+            val preRoll = ArrayDeque<ByteArray>()
+            var recording: ByteArrayOutputStream? = null
+            var silentChunkStreak = 0
+            var totalChunkCount = 0
+            var voicedChunkCount = 0
+
+            while (isActive) {
+                val read = record.read(buffer, 0, buffer.size)
+                if (read <= 0 || muted.get()) continue
+
+                val chunk = buffer.copyOf(read)
+                val voiced = rms(chunk) > VOICE_RMS_THRESHOLD
+                val current = recording
+
+                if (current == null) {
+                    // Not recording an utterance yet -- keep a short rolling
+                    // pre-roll so the moment speech starts, we already have
+                    // a little lead-in and don't clip the first phoneme.
+                    preRoll.addLast(chunk)
+                    if (preRoll.size > PRE_ROLL_CHUNKS) preRoll.removeFirst()
+
+                    if (voiced) {
+                        val started = ByteArrayOutputStream()
+                        preRoll.forEach { started.write(it) }
+                        preRoll.clear()
+                        recording = started
+                        totalChunkCount = started.size() / CHUNK_BYTES
+                        voicedChunkCount = 1
+                        silentChunkStreak = 0
+                    }
+                    continue
+                }
+
+                current.write(chunk)
+                totalChunkCount++
+                if (voiced) {
+                    voicedChunkCount++
+                    silentChunkStreak = 0
+                } else {
+                    silentChunkStreak++
+                }
+
+                val utteranceMs = totalChunkCount * CHUNK_MS
+                val silenceMs = silentChunkStreak * CHUNK_MS
+                if (silenceMs >= SILENCE_TIMEOUT_MS || utteranceMs >= MAX_UTTERANCE_MS) {
+                    recording = null
+                    val pcm = current.toByteArray()
+                    val hadEnoughSpeech = (voicedChunkCount * CHUNK_MS) >= MIN_VOICED_MS
+                    if (hadEnoughSpeech) {
+                        muted.set(true)
+                        onEvent(BatchTranscriptEvent.Transcribing)
+                        processUtterance(pcm, onEvent)
+                        muted.set(false)
+                        onEvent(BatchTranscriptEvent.Listening)
+                    }
+                }
+            }
+        }
+    }
+
+    private suspend fun processUtterance(pcm: ByteArray, onEvent: (BatchTranscriptEvent) -> Unit) {
+        val key = apiKey
+        if (key.isNullOrBlank()) {
+            onEvent(BatchTranscriptEvent.Error("missing API key"))
+            return
+        }
+        try {
+            val wav = pcmToWav(pcm, SAMPLE_RATE_HZ)
+            val uploadUrl = uploadAudio(key, wav)
+            val transcriptId = createTranscript(key, uploadUrl)
+            val text = pollTranscript(key, transcriptId)
+            onEvent(BatchTranscriptEvent.Result(text))
+        } catch (t: Throwable) {
+            Log.w(TAG, "Transcription failed", t)
+            onEvent(BatchTranscriptEvent.Error(t.message ?: "transcription failed"))
+        }
+    }
+
+    private fun uploadAudio(apiKey: String, wav: ByteArray): String {
+        val request = Request.Builder()
+            .url(UPLOAD_ENDPOINT)
+            .addHeader("authorization", apiKey)
+            .post(wav.toRequestBody("application/octet-stream".toMediaType()))
+            .build()
+        httpClient.newCall(request).execute().use { response ->
+            val bodyText = response.body?.string().orEmpty()
+            if (!response.isSuccessful) throw IOException("upload failed: HTTP ${response.code}")
+            return JSONObject(bodyText).getString("upload_url")
+        }
+    }
+
+    private fun createTranscript(apiKey: String, audioUrl: String): String {
+        val payload = JSONObject().apply {
+            put("audio_url", audioUrl)
+            // Auto-detect between whichever language the user actually
+            // spoke (Indonesian or English) instead of requiring them to
+            // pick one -- see class doc.
+            put("language_detection", true)
+            // Bias toward the wake word -- same rationale as the old
+            // realtime implementation's prompt biasing: on-device testing
+            // found "NAVI" reliably misheard as "Navy".
+            put("word_boost", JSONArray(listOf("navi", "navy")))
+            put("boost_param", "high")
+        }
+        val request = Request.Builder()
+            .url(TRANSCRIPT_ENDPOINT)
+            .addHeader("authorization", apiKey)
+            .post(payload.toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        httpClient.newCall(request).execute().use { response ->
+            val bodyText = response.body?.string().orEmpty()
+            if (!response.isSuccessful) throw IOException("transcript create failed: HTTP ${response.code}")
+            return JSONObject(bodyText).getString("id")
+        }
+    }
+
+    private suspend fun pollTranscript(apiKey: String, id: String): String {
+        val request = Request.Builder()
+            .url("$TRANSCRIPT_ENDPOINT/$id")
+            .addHeader("authorization", apiKey)
+            .get()
+            .build()
+        val deadline = System.currentTimeMillis() + POLL_TIMEOUT_MS
+        while (System.currentTimeMillis() < deadline) {
+            httpClient.newCall(request).execute().use { response ->
+                val bodyText = response.body?.string().orEmpty()
+                if (!response.isSuccessful) throw IOException("poll failed: HTTP ${response.code}")
+                val json = JSONObject(bodyText)
+                when (json.optString("status")) {
+                    "completed" -> return json.optString("text")
+                    "error" -> throw IOException(json.optString("error", "transcription error"))
+                    else -> Unit // queued / processing -- keep polling
+                }
+            }
+            delay(POLL_INTERVAL_MS)
+        }
+        throw IOException("transcription timed out")
+    }
+
+    private fun stopAudioRecord() {
+        audioRecord?.apply {
+            runCatching { stop() }
+            release()
+        }
+        audioRecord = null
+    }
+
+    /** Root-mean-square amplitude of 16-bit little-endian PCM samples -- a simple energy-based voiced/silence signal. */
+    private fun rms(buffer: ByteArray): Double {
+        if (buffer.size < 2) return 0.0
+        var sumSquares = 0.0
+        var sampleCount = 0
+        var i = 0
+        while (i + 1 < buffer.size) {
+            val sample = ((buffer[i + 1].toInt() shl 8) or (buffer[i].toInt() and 0xFF)).toShort().toInt()
+            sumSquares += (sample * sample).toDouble()
+            sampleCount++
+            i += 2
+        }
+        return if (sampleCount == 0) 0.0 else sqrt(sumSquares / sampleCount)
+    }
+
+    /** Wraps raw 16-bit mono PCM in a standard 44-byte WAV header -- AssemblyAI's upload endpoint expects a real audio container, not bare PCM. */
+    private fun pcmToWav(pcm: ByteArray, sampleRateHz: Int): ByteArray {
+        val channels = 1
+        val bitsPerSample = 16
+        val byteRate = sampleRateHz * channels * bitsPerSample / 8
+        val blockAlign = channels * bitsPerSample / 8
+        val header = ByteArray(44)
+
+        fun writeString(offset: Int, s: String) = s.forEachIndexed { i, c -> header[offset + i] = c.code.toByte() }
+        fun writeIntLE(offset: Int, v: Int) {
+            header[offset] = (v and 0xFF).toByte()
+            header[offset + 1] = ((v shr 8) and 0xFF).toByte()
+            header[offset + 2] = ((v shr 16) and 0xFF).toByte()
+            header[offset + 3] = ((v shr 24) and 0xFF).toByte()
+        }
+        fun writeShortLE(offset: Int, v: Int) {
+            header[offset] = (v and 0xFF).toByte()
+            header[offset + 1] = ((v shr 8) and 0xFF).toByte()
+        }
+
+        writeString(0, "RIFF")
+        writeIntLE(4, 36 + pcm.size)
+        writeString(8, "WAVE")
+        writeString(12, "fmt ")
+        writeIntLE(16, 16)
+        writeShortLE(20, 1)
+        writeShortLE(22, channels)
+        writeIntLE(24, sampleRateHz)
+        writeIntLE(28, byteRate)
+        writeShortLE(32, blockAlign)
+        writeShortLE(34, bitsPerSample)
+        writeString(36, "data")
+        writeIntLE(40, pcm.size)
+
+        return header + pcm
+    }
+
+    private companion object {
+        const val TAG = "AssemblyAiBatchTranscriber"
+
+        const val UPLOAD_ENDPOINT = "https://api.assemblyai.com/v2/upload"
+        const val TRANSCRIPT_ENDPOINT = "https://api.assemblyai.com/v2/transcript"
+
+        const val SAMPLE_RATE_HZ = 16000
+        const val CHUNK_MS = 100
+
+        /** 16-bit samples = 2 bytes/sample; 100ms of 16kHz mono audio. */
+        const val CHUNK_BYTES = SAMPLE_RATE_HZ * 2 * CHUNK_MS / 1000
+
+        /** Rolling lead-in kept before speech is detected, so the start of an utterance isn't clipped. */
+        const val PRE_ROLL_CHUNKS = 3
+
+        /**
+         * Energy threshold (RMS of signed 16-bit samples, max ~32767) above
+         * which a chunk is treated as voiced. Picked conservatively for a
+         * phone mic in normal indoor/outdoor ambient noise; may need
+         * on-device tuning per the actual noise floor this app is used in.
+         */
+        const val VOICE_RMS_THRESHOLD = 500.0
+
+        /** Silence after speech, before an utterance is considered finished and sent off for transcription. */
+        const val SILENCE_TIMEOUT_MS = 2000L
+
+        /** Minimum total voiced time for a captured utterance to be worth transcribing -- filters out brief noise blips. */
+        const val MIN_VOICED_MS = 250L
+
+        /** Hard cap on a single utterance's length, so a stuck/very long recording can't grow unbounded. */
+        const val MAX_UTTERANCE_MS = 12000L
+
+        const val POLL_INTERVAL_MS = 500L
+        const val POLL_TIMEOUT_MS = 20000L
+    }
+}

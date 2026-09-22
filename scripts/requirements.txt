@@ -1,0 +1,13 @@
+# Model conversion environment for NAVI AI.
+# ultralytics' NCNN export path auto-installs its own pinned `ncnn` and
+# `pnnx` Python packages on first use (unrelated to the C++ NCNN library
+# vendored under app/src/main/cpp/third_party/ncnn/) -- no separate
+# pnnx/protobuf toolchain install is required.
+#
+# Verified working (torch CPU wheel; a CUDA wheel is fine too if you have a
+# GPU, export itself runs on CPU regardless):
+ultralytics==8.4.158
+torch==2.14.0
+onnx>=1.17.0
+onnxsim>=0.4.36
+onnxruntime>=1.20.0

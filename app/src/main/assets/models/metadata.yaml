@@ -1,0 +1,26 @@
+description: 'Ultralytics YOLOv8n model, exported to NCNN'
+author: Ultralytics
+model: yolov8n.pt
+task: detect
+imgsz:
+- 320
+- 320
+input_blob: in0
+output_blob: out0
+output_format: 'per anchor: [cx, cy, w, h, class_0..class_79] -- boxes already decoded
+  to absolute pixel coords in the 320x320 letterboxed input space, class scores
+  already sigmoid-activated, no objectness channel'
+anchors: 2100
+strides:
+- 8
+- 16
+- 32
+notes: >
+  Replaced an earlier YOLOv12n export that used MatMul/Reduction-based
+  Area-Attention blocks, which reproducibly crashed (SIGSEGV/SEGV_ACCERR,
+  MTE tag-mismatch on memcpy) inside the vendored NCNN build's layer
+  forward pass on a real Android 16 device -- confirmed via a symbolicated
+  on-device tombstone and blob-by-blob bisection (see README.md, section 1).
+  YOLOv8n uses only Convolution/Concat/Reshape/Softmax/Sigmoid/Pooling/
+  Interp -- the long-established, heavily field-tested ncnn op set -- and
+  runs stably on-device.
