@@ -13,6 +13,22 @@
          distance estimation, and risk assessment remain fully offline. -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- Route recording/navigation (see location/, routenav/). -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!-- Package-visibility requirement (API 30+) for SpeechRecognizer to find
+         the on-device recognizer service used by Offline Mode's voice
+         commands (see audio/AndroidSpeechRecognizerTranscriber.kt). -->
+    <queries>
+        <intent>
+            <action android:name="android.speech.RecognitionService" />
+        </intent>
+    </queries>
+
     <application
         android:name=".NAVIApplication"
         android:allowBackup="true"
@@ -35,6 +51,11 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <service
+            android:name=".routenav.RouteNavigationService"
+            android:exported="false"
+            android:foregroundServiceType="location" />
     </application>
 
 </manifest>

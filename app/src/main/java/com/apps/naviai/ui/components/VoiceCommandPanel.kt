@@ -99,7 +99,7 @@ fun VoiceCommandPanel(modifier: Modifier = Modifier, viewModel: VoiceCommandView
             Spacer(Modifier.size(12.dp))
 
             Column {
-                Text("NAVI Voice Command", style = MaterialTheme.typography.labelLarge)
+                Text("NAVI Voice Command", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text(
                     text = statusLabel(uiState.status, micPermission.isGranted),
                     style = MaterialTheme.typography.bodySmall,

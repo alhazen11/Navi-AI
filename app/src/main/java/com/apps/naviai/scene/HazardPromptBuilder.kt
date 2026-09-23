@@ -24,7 +24,7 @@ object HazardPromptBuilder {
 
                 Gambar terlampir adalah pandangan kamera pengguna saat ini -- gunakan untuk mengonfirmasi atau melengkapi jenis objeknya jika membantu.
 
-                Tugasmu: berikan SATU kalimat peringatan singkat, bernada netral dan tenang (bukan panik atau berlebihan), tentang objek besar yang mungkin menghalangi jalan pengguna. Jika jarak tidak bisa dipastikan, gunakan frasa seperti "ada objek di depan, mungkin kursi" -- jangan memastikan jarak atau jenis objek yang sebenarnya tidak yakin. JANGAN memberi instruksi berjalan yang pasti (mis. "belok kiri sekarang", "mundur tiga langkah") -- cukup peringatan naratif, mis. "Silakan pelan-pelan melewatinya." Jangan mengarang objek yang tidak ada di data atau gambar di atas.
+                Tugasmu: berikan SATU kalimat peringatan singkat, bernada netral dan tenang (bukan panik atau berlebihan), tentang objek besar yang mungkin menghalangi jalan pengguna. Jika jarak objek DIKETAHUI (lihat data sensor di atas), SEBUTKAN jaraknya secara alami dalam kalimat (mis. "sekitar dua meter"), contoh: "Perhatian: ada kursi di depan Anda sekitar dua meter. Silakan pelan-pelan melewatinya." Jika jarak TIDAK bisa dipastikan, gunakan frasa seperti "ada objek di depan, mungkin kursi" tanpa menyebut angka jarak -- jangan memastikan jarak atau jenis objek yang sebenarnya tidak yakin. JANGAN memberi instruksi berjalan yang pasti (mis. "belok kiri sekarang", "mundur tiga langkah") -- cukup peringatan naratif. Jangan mengarang objek yang tidak ada di data atau gambar di atas.
             """.trimIndent()
 
             AnnouncementLanguage.ENGLISH -> """
@@ -33,7 +33,7 @@ object HazardPromptBuilder {
 
                 The attached image is the user's current camera view -- use it to confirm or refine the object type if it helps.
 
-                Your task: give ONE short warning sentence, neutral and calm in tone (not alarming or exaggerated), about the large object that may be blocking the user's path. If distance can't be pinned down, use phrasing like "there's an object ahead, possibly a chair" -- don't assert a distance or object type you aren't actually sure of. DO NOT give definite walking instructions (e.g. "turn left now", "step back three paces") -- just a narrative caution, e.g. "Please walk slowly past it." Don't invent objects that aren't in the data or image above.
+                Your task: give ONE short warning sentence, neutral and calm in tone (not alarming or exaggerated), about the large object that may be blocking the user's path. If the object's distance IS known (see the sensor data above), INCLUDE it naturally in the sentence (e.g. "about two meters"), for example: "Caution: there's a chair about two meters ahead. Please walk slowly past it." If distance can't be pinned down, use phrasing like "there's an object ahead, possibly a chair" without stating a distance -- don't assert a distance or object type you aren't actually sure of. DO NOT give definite walking instructions (e.g. "turn left now", "step back three paces") -- just a narrative caution. Don't invent objects that aren't in the data or image above.
             """.trimIndent()
         }
     }

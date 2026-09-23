@@ -14,7 +14,7 @@ android {
     defaultConfig {
         applicationId = "com.apps.naviai"
         minSdk = 26
-        targetSdk = 35
+        targetSdk = 36
         versionCode = 1
         versionName = "1.0"
 
@@ -129,6 +129,12 @@ dependencies {
 
     // AssemblyAI realtime speech-to-text (voice commands): WebSocket client
     implementation(libs.okhttp)
+
+    // Route recording/navigation: local route storage + GPS
+    implementation(libs.androidx.room.runtime)
+    implementation(libs.androidx.room.ktx)
+    ksp(libs.androidx.room.compiler)
+    implementation(libs.play.services.location)
 
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)

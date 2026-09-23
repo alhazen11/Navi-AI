@@ -1,11 +1,16 @@
 package com.apps.naviai.ui.viewmodel
 
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
 import android.util.Log
 import androidx.camera.core.CameraSelector
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.apps.naviai.audio.AnnouncementLanguage
 import com.apps.naviai.audio.AnnouncementManager
+import com.apps.naviai.audio.ProcessingCue
 import com.apps.naviai.audio.TextToSpeechManager
 import com.apps.naviai.audio.TtsAvailability
 import com.apps.naviai.audio.VoiceCommandManager
@@ -14,10 +19,12 @@ import com.apps.naviai.camera.FrameAnalyzer
 import com.apps.naviai.camera.ImageUtils
 import com.apps.naviai.core.common.InferenceDispatcher
 import com.apps.naviai.core.common.IoDispatcher
+import com.apps.naviai.core.common.LocalEndpoint
 import com.apps.naviai.core.performance.PerformanceMonitor
 import com.apps.naviai.core.performance.PerformanceStats
 import com.apps.naviai.data.calibration.CalibrationData
 import com.apps.naviai.data.calibration.CalibrationRepository
+import com.apps.naviai.database.RouteRepository
 import com.apps.naviai.detection.detector.DetectorState
 import com.apps.naviai.detection.detector.FrameInput
 import com.apps.naviai.detection.detector.ObjectDetector
@@ -32,6 +39,12 @@ import com.apps.naviai.detection.tracking.TrackedObject
 import com.apps.naviai.domain.model.AppSettings
 import com.apps.naviai.domain.model.CameraParameters
 import com.apps.naviai.llm.LlmClient
+import com.apps.naviai.memory.MemoryManager
+import com.apps.naviai.recording.RouteRecorder
+import com.apps.naviai.recording.RouteRecordingMatcher
+import com.apps.naviai.recording.RouteRenameMatcher
+import com.apps.naviai.routenav.NavigationAnnouncements
+import com.apps.naviai.routenav.NavigationCommandMatcher
 import com.apps.naviai.scene.DetectedObjectSummary
 import com.apps.naviai.scene.HazardPromptBuilder
 import com.apps.naviai.scene.HazardTrigger
@@ -45,8 +58,11 @@ import com.apps.naviai.scene.TextReadingMatcher
 import com.apps.naviai.scene.TextReadingPromptBuilder
 import com.apps.naviai.settings.SettingsRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
@@ -86,6 +102,12 @@ sealed interface ObjectSearchStatus {
     data class Failure(val message: String) : ObjectSearchStatus
 }
 
+/** One-shot navigation triggered by a voice command that leaves this screen -- see [DetectionViewModel.handleVoiceCommand]. */
+sealed interface DetectionNavigationEvent {
+    data object GoToRecording : DetectionNavigationEvent
+    data class GoToNavigation(val routeName: String) : DetectionNavigationEvent
+}
+
 data class DetectionUiState(
     val detectorState: DetectorState = DetectorState.Uninitialized,
     val trackedObjects: List<TrackedObject> = emptyList(),
@@ -109,6 +131,7 @@ data class DetectionUiState(
 
 @HiltViewModel
 class DetectionViewModel @Inject constructor(
+    @ApplicationContext private val context: Context,
     private val objectDetector: ObjectDetector,
     private val distanceEstimator: DistanceEstimator,
     private val objectTracker: ObjectTracker,
@@ -119,6 +142,9 @@ class DetectionViewModel @Inject constructor(
     private val calibrationRepository: CalibrationRepository,
     private val voiceCommandManager: VoiceCommandManager,
     private val llmClient: LlmClient,
+    private val routeRecorder: RouteRecorder,
+    private val routeRepository: RouteRepository,
+    private val memoryManager: MemoryManager,
     @InferenceDispatcher private val inferenceDispatcher: CoroutineDispatcher,
     @IoDispatcher private val ioDispatcher: CoroutineDispatcher
 ) : ViewModel() {
@@ -127,6 +153,16 @@ class DetectionViewModel @Inject constructor(
 
     private val _uiState = MutableStateFlow(DetectionUiState())
     val uiState: StateFlow<DetectionUiState> = _uiState.asStateFlow()
+
+    /**
+     * One-shot events for voice commands that hand off to a different
+     * screen entirely (Route Recording/Navigation -- everything else this
+     * screen handles in place). Absorbed here, along with the dispatch
+     * logic below, from a since-removed HomeScreen/HomeViewModel: this app
+     * now has a single screen for every voice-triggered feature.
+     */
+    private val _navigationEvents = MutableSharedFlow<DetectionNavigationEvent>(extraBufferCapacity = 1)
+    val navigationEvents: SharedFlow<DetectionNavigationEvent> = _navigationEvents
 
     @Volatile private var currentSettings: AppSettings = AppSettings()
     @Volatile private var currentCalibration: CalibrationData? = null
@@ -171,13 +207,22 @@ class DetectionViewModel @Inject constructor(
             voiceCommandManager.state.collect { voiceState ->
                 if (voiceState.status != VoiceCommandStatus.RECOGNIZED || voiceState.eventId == lastHandledVoiceEventId) return@collect
                 val command = voiceState.command ?: return@collect
-
                 lastHandledVoiceEventId = voiceState.eventId
-                val searchQuery = ObjectSearchMatcher.extractQuery(command)
-                when {
-                    SceneDescriptionMatcher.matches(command) -> describeSurroundings(command)
-                    TextReadingMatcher.matches(command) -> readTextAloud(command)
-                    searchQuery != null -> searchForObject(searchQuery)
+                // This collect{} is the single dispatcher for every
+                // voice-triggered feature on this screen (Memory, Route
+                // Recording/Navigation, Scene/Text/Object). An uncaught
+                // exception anywhere inside handleVoiceCommand (e.g. a Room
+                // error from MemoryManager) would otherwise propagate out of
+                // this coroutine and permanently end this collector, silently
+                // breaking every future "NAVI, ..." command until the
+                // ViewModel is recreated -- so failures here are contained
+                // and logged instead of allowed to kill the whole pipeline.
+                try {
+                    handleVoiceCommand(command)
+                } catch (c: kotlinx.coroutines.CancellationException) {
+                    throw c
+                } catch (t: Throwable) {
+                    Log.e(TAG, "Error handling voice command \"$command\"", t)
                 }
             }
         }
@@ -231,6 +276,124 @@ class DetectionViewModel @Inject constructor(
         if (!enabled) ttsManager.stop()
     }
 
+    /**
+     * Central dispatcher for every recognized "NAVI, ..." command on this
+     * screen. Order matters:
+     * 1. [MemoryManager] first -- self-limiting (only claims a bare
+     *    question like "di mana rumah saya?" if it actually finds a
+     *    matching memory; see its class doc), so it can safely go before
+     *    Object Search below without swallowing unrelated "di mana X"
+     *    questions.
+     * 2. Route Recording/Navigation start commands -- distinctive
+     *    prefixes ("mulai merekam jalan", "mulai navigasi X"), hand off
+     *    to a different screen via [navigationEvents].
+     * 3. Route rename -- distinctive "ganti/ubah nama rute X.../rename
+     *    route X..." prefix, handled in place (no screen change).
+     * 4. Scene Understanding / Text Reading -- specific exact-phrase
+     *    matchers, low collision risk.
+     * 5. Object Search -- broadest matcher (any "di mana X"/"cari X"/
+     *    "ada X" question), checked last as the catch-all.
+     */
+    private suspend fun handleVoiceCommand(command: String) {
+        if (memoryManager.handleCommand(command)) return
+
+        if (RouteRecordingMatcher.isStart(command)) {
+            if (hasLocationPermission()) routeRecorder.start()
+            _navigationEvents.tryEmit(DetectionNavigationEvent.GoToRecording)
+            return
+        }
+
+        // RouteRecorder is a singleton that keeps recording across screens,
+        // but the "stop merekam jalan" -> ask-for-a-name dialogue only lives
+        // in RecordingViewModel (RecordingScreen's ViewModel). Without this
+        // branch, saying "stop merekam jalan" after navigating back to this
+        // screen mid-recording did nothing at all. Just navigating to
+        // RecordingScreen (not calling routeRecorder.stop() here directly)
+        // is deliberate: RecordingViewModel's own fresh voice-state
+        // collector will see this same still-RECOGNIZED command as new and
+        // run its full stop+ask-name+save flow itself once mounted, so that
+        // logic isn't duplicated here.
+        if (RouteRecordingMatcher.isStop(command) && routeRecorder.isRecording) {
+            _navigationEvents.tryEmit(DetectionNavigationEvent.GoToRecording)
+            return
+        }
+
+        val renameRequest = RouteRenameMatcher.extract(command)
+        if (renameRequest != null) {
+            renameRoute(renameRequest.oldName, renameRequest.newName)
+            return
+        }
+
+        val navRouteName = NavigationCommandMatcher.extractRouteName(command)
+        if (navRouteName != null) {
+            val route = routeRepository.getRouteWithPointsByName(navRouteName)
+            if (route != null && route.points.isNotEmpty()) {
+                _navigationEvents.tryEmit(DetectionNavigationEvent.GoToNavigation(navRouteName))
+            } else {
+                ttsManager.speak(
+                    NavigationAnnouncements.routeNotFound(navRouteName, currentSettings.speechLanguage),
+                    flushQueue = false,
+                    utteranceId = "route_not_found"
+                )
+            }
+            return
+        }
+
+        when {
+            SceneDescriptionMatcher.matches(command) -> describeSurroundings(command)
+            TextReadingMatcher.matches(command) -> readTextAloud(command)
+            else -> ObjectSearchMatcher.extractQuery(command)?.let { searchForObject(it) }
+        }
+    }
+
+    /**
+     * True when Offline Mode should block a call to [baseUrl]: the setting
+     * is on AND the endpoint isn't a local/LAN server (see [LocalEndpoint])
+     * -- a local Ollama/LM Studio setup never leaves the device/LAN, so it
+     * stays usable in Offline Mode; a hosted endpoint does not.
+     */
+    private fun offlineModeBlocksLlm(baseUrl: String): Boolean =
+        currentSettings.offlineModeEnabled && !LocalEndpoint.isLocal(baseUrl)
+
+    private fun offlineModeMessage(language: AnnouncementLanguage): String = when (language) {
+        AnnouncementLanguage.INDONESIAN -> "Fitur ini butuh internet dan dinonaktifkan saat Mode Offline aktif."
+        AnnouncementLanguage.ENGLISH -> "This feature needs the internet and is disabled while Offline Mode is on."
+    }
+
+    private fun hasLocationPermission(): Boolean =
+        ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+
+    /**
+     * "Ganti nama rute X menjadi Y" / "rename route X to Y": looks [oldName]
+     * up by its saved name (same case-insensitive lookup Navigation's
+     * "mulai navigasi X" uses) and renames it in place. Speaks a "route not
+     * found" message rather than silently no-oping when [oldName] doesn't
+     * match any saved route -- a misheard/mistyped-by-voice old name is the
+     * likely failure mode here, so the user needs to know it didn't work.
+     */
+    private fun renameRoute(oldName: String, newName: String) {
+        val language = currentSettings.speechLanguage
+        viewModelScope.launch {
+            val renamed = routeRepository.renameRouteByName(oldName, newName)
+            val message = if (renamed) {
+                routeRenamedMessage(oldName, newName, language)
+            } else {
+                routeRenameNotFoundMessage(oldName, language)
+            }
+            ttsManager.speak(message, flushQueue = false, utteranceId = "route_renamed")
+        }
+    }
+
+    private fun routeRenamedMessage(oldName: String, newName: String, language: AnnouncementLanguage): String = when (language) {
+        AnnouncementLanguage.INDONESIAN -> "Rute $oldName sudah diganti nama menjadi $newName."
+        AnnouncementLanguage.ENGLISH -> "Route $oldName has been renamed to $newName."
+    }
+
+    private fun routeRenameNotFoundMessage(oldName: String, language: AnnouncementLanguage): String = when (language) {
+        AnnouncementLanguage.INDONESIAN -> "Rute bernama $oldName tidak ditemukan."
+        AnnouncementLanguage.ENGLISH -> "I couldn't find a route named $oldName."
+    }
+
     /** Manual trigger (e.g. a UI button) for the same flow the "jelaskan lingkungan" voice command reaches. */
     fun describeSurroundingsManually() = describeSurroundings(manualRequestLabel(currentSettings.speechLanguage))
 
@@ -255,6 +418,10 @@ class DetectionViewModel @Inject constructor(
             failScene(missingLlmConfigMessage(language))
             return
         }
+        if (offlineModeBlocksLlm(baseUrl)) {
+            failScene(offlineModeMessage(language))
+            return
+        }
 
         val trackedObjects = _uiState.value.trackedObjects
         val highestRisk = trackedObjects.maxByOrNull { it.riskLevel.priority }?.riskLevel ?: RiskLevel.SAFE
@@ -269,6 +436,7 @@ class DetectionViewModel @Inject constructor(
         }
 
         _uiState.update { it.copy(sceneDescriptionStatus = SceneDescriptionStatus.Processing) }
+        ttsManager.speak(ProcessingCue.message(language), flushQueue = false, utteranceId = "scene_description_processing")
 
         viewModelScope.launch {
             val jpeg = withContext(ioDispatcher) {
@@ -339,8 +507,13 @@ class DetectionViewModel @Inject constructor(
             failTextReading(missingLlmConfigMessage(language))
             return
         }
+        if (offlineModeBlocksLlm(baseUrl)) {
+            failTextReading(offlineModeMessage(language))
+            return
+        }
 
         _uiState.update { it.copy(textReadingStatus = TextReadingStatus.Processing) }
+        ttsManager.speak(ProcessingCue.message(language), flushQueue = false, utteranceId = "text_reading_processing")
 
         viewModelScope.launch {
             // Higher JPEG quality than the scene-description capture --
@@ -394,6 +567,7 @@ class DetectionViewModel @Inject constructor(
         val baseUrl = currentSettings.llmBaseUrl
         val model = currentSettings.llmModel
         if (baseUrl.isNullOrBlank() || model.isNullOrBlank()) return
+        if (offlineModeBlocksLlm(baseUrl)) return
 
         val candidate = trackedObjects.firstOrNull { tracked ->
             val lastWarnedAt = hazardWarnedTrackIds[tracked.trackingId] ?: 0L
@@ -466,6 +640,10 @@ class DetectionViewModel @Inject constructor(
             failObjectSearch(missingLlmConfigMessage(language))
             return
         }
+        if (offlineModeBlocksLlm(baseUrl)) {
+            failObjectSearch(offlineModeMessage(language))
+            return
+        }
 
         val trackedObjects = _uiState.value.trackedObjects
         val frameWidth = _uiState.value.frameUprightWidth
@@ -481,8 +659,16 @@ class DetectionViewModel @Inject constructor(
         }
 
         _uiState.update { it.copy(objectSearchStatus = ObjectSearchStatus.Processing) }
+        ttsManager.speak(ProcessingCue.message(language), flushQueue = false, utteranceId = "object_search_processing")
 
         viewModelScope.launch {
+            // Higher JPEG quality than Scene Understanding/Hazard's default
+            // (80) -- same reasoning as Text Reading's quality=92: a thin
+            // target like a cable/wire is exactly the kind of fine detail
+            // that default-quality compression artifacts destroy, which is
+            // what was making the vision LLM correctly (per its own
+            // instructions -- see ObjectSearchPromptBuilder) but wrongly-in-
+            // -intent report the image as too unclear to judge, every time.
             val jpeg = withContext(ioDispatcher) {
                 ImageUtils.rgbaToUprightJpeg(frame.rgba, frame.width, frame.height, frame.rotationDegrees, frame.mirror)
             }

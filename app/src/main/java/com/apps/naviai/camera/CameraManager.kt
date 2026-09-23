@@ -63,4 +63,16 @@ class CameraManager @Inject constructor(@ApplicationContext private val context:
     fun unbindAll(provider: ProcessCameraProvider) {
         provider.unbindAll()
     }
+
+    /** Same as [bind] but without an ImageAnalysis use case -- for screens that only need a live preview (e.g. route navigation), not frame analysis. */
+    fun bindPreviewOnly(
+        lifecycleOwner: LifecycleOwner,
+        provider: ProcessCameraProvider,
+        preview: Preview,
+        @CameraSelector.LensFacing lensFacing: Int
+    ): Camera {
+        val selector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
+        provider.unbindAll()
+        return provider.bindToLifecycle(lifecycleOwner, selector, preview)
+    }
 }

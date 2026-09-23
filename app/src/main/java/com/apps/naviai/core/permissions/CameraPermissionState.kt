@@ -44,3 +44,6 @@ fun rememberCameraPermissionState(): SinglePermissionState = rememberPermissionS
 
 @Composable
 fun rememberMicrophonePermissionState(): SinglePermissionState = rememberPermissionState(Manifest.permission.RECORD_AUDIO)
+
+@Composable
+fun rememberLocationPermissionState(): SinglePermissionState = rememberPermissionState(Manifest.permission.ACCESS_FINE_LOCATION)

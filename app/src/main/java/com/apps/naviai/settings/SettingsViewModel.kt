@@ -66,6 +66,7 @@ class SettingsViewModel @Inject constructor(
     fun setLlmBaseUrl(value: String) = viewModelScope.launch { settingsRepository.setLlmBaseUrl(value) }
     fun setLlmApiKey(value: String) = viewModelScope.launch { settingsRepository.setLlmApiKey(value) }
     fun setLlmModel(value: String) = viewModelScope.launch { settingsRepository.setLlmModel(value) }
+    fun setOfflineModeEnabled(value: Boolean) = viewModelScope.launch { settingsRepository.setOfflineModeEnabled(value) }
 
     /** Pings the configured LLM endpoint's /models listing to verify it's reachable -- doesn't persist anything. */
     fun testLlmConnection(baseUrl: String, apiKey: String?, model: String?) {

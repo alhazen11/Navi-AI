@@ -1,8 +1,10 @@
 package com.apps.naviai.audio
 
+import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -62,13 +64,28 @@ data class VoiceCommandUiState(
  *
  * This class does NOT execute commands -- it only captures and surfaces
  * the recognized text. Command dispatch is a future step.
+ *
+ * **Engine switching (Offline Mode)**: [startContinuousListening]'s
+ * `offlineModeEnabled` parameter picks between two [VoiceTranscriber]
+ * implementations -- [AssemblyAiBatchTranscriber] (cloud, the default) and
+ * [AndroidSpeechRecognizerTranscriber] (on-device, Android 12+ only). Both
+ * emit the same [BatchTranscriptEvent]s, so [handleEvent] and every wake-
+ * word/dispatch concern below are completely unaware of which one is
+ * active. Switching engines always stops the previously active one first
+ * (see [startContinuousListening]) -- only one may hold the microphone at
+ * a time.
  */
 @Singleton
 class VoiceCommandManager @Inject constructor(
     private val speaker: Speaker,
-    httpClient: OkHttpClient
+    httpClient: OkHttpClient,
+    @ApplicationContext context: Context
 ) {
-    private val transcriber = AssemblyAiBatchTranscriber(httpClient)
+    private val cloudTranscriber: VoiceTranscriber = AssemblyAiBatchTranscriber(httpClient)
+    private val onDeviceTranscriber: VoiceTranscriber = AndroidSpeechRecognizerTranscriber(context)
+
+    /** Whichever engine is currently active -- see the class doc's "Engine switching" note. */
+    private var transcriber: VoiceTranscriber = cloudTranscriber
 
     private val _state = MutableStateFlow(VoiceCommandUiState())
     val state: StateFlow<VoiceCommandUiState> = _state.asStateFlow()
@@ -78,17 +95,53 @@ class VoiceCommandManager @Inject constructor(
     private var apiKey: String? = null
     private var active = false
     private var recognizedEventCounter = 0L
+    private var pendingRawUtteranceCallback: ((String) -> Unit)? = null
 
     /**
      * Must be called from the main thread. Idempotent while already active
-     * with the same key -- but if [apiKey] differs from the one currently
-     * connected with (e.g. the key just arrived from a settings load that
-     * raced with an earlier call made before it was ready, or the user
-     * edited it), reconnects with the new one instead of silently no-oping.
+     * with the same key/engine -- but if [apiKey] differs from the one
+     * currently connected with (e.g. the key just arrived from a settings
+     * load that raced with an earlier call made before it was ready, or the
+     * user edited it), reconnects with the new one instead of silently
+     * no-oping.
+     *
+     * [offlineModeEnabled] picks the engine (see the class doc's "Engine
+     * switching" note): true routes through [onDeviceTranscriber]
+     * ([AndroidSpeechRecognizerTranscriber], Android 12+ only -- see its
+     * class doc for why older devices can't offer a verified-offline
+     * engine at all); false uses [cloudTranscriber] as before. A change
+     * either way always stops whichever engine was previously active first
+     * -- only one may hold the microphone at a time.
      */
-    fun startContinuousListening(language: AnnouncementLanguage, apiKey: String?) {
-        val keyChanged = apiKey != this.apiKey
+    fun startContinuousListening(language: AnnouncementLanguage, apiKey: String?, offlineModeEnabled: Boolean = false) {
         this.language = language
+
+        val targetTranscriber: VoiceTranscriber = if (offlineModeEnabled) onDeviceTranscriber else cloudTranscriber
+        if (targetTranscriber !== transcriber) {
+            transcriber.stop()
+            transcriber = targetTranscriber
+            active = false
+        }
+
+        if (offlineModeEnabled) {
+            if (!transcriber.isSupported()) {
+                active = false
+                _state.value = VoiceCommandUiState(status = VoiceCommandStatus.UNAVAILABLE, message = onDeviceUnsupportedMessage(language))
+                return
+            }
+            if (active) {
+                // Already listening on-device -- just make sure a
+                // mid-session language change in Settings takes effect on
+                // the next utterance.
+                transcriber.setLanguage(language)
+                return
+            }
+            active = true
+            transcriber.start(null, language) { event -> mainHandler.post { handleEvent(event) } }
+            return
+        }
+
+        val keyChanged = apiKey != this.apiKey
         this.apiKey = apiKey
 
         if (apiKey.isNullOrBlank()) {
@@ -97,15 +150,23 @@ class VoiceCommandManager @Inject constructor(
             return
         }
 
-        if (active && !keyChanged) return
+        if (active && !keyChanged) {
+            // Already connected -- but the language may have just changed
+            // in Settings, so make sure the next utterance uses it even
+            // without a full reconnect.
+            transcriber.setLanguage(language)
+            return
+        }
         active = true
-        transcriber.start(apiKey) { event -> mainHandler.post { handleEvent(event) } }
+        transcriber.start(apiKey, language) { event -> mainHandler.post { handleEvent(event) } }
     }
 
     /** Stops listening entirely; no further auto-restart until [startContinuousListening] is called again. */
     fun stopListening() {
         active = false
         mainHandler.removeCallbacksAndMessages(null)
+        pendingRawUtteranceCallback = null
+        transcriber.setWakeWordBoostEnabled(true)
         transcriber.stop()
         _state.update { current ->
             if (current.status == VoiceCommandStatus.UNAVAILABLE) current else current.copy(status = VoiceCommandStatus.PAUSED, message = null)
@@ -115,6 +176,8 @@ class VoiceCommandManager @Inject constructor(
     fun reset() {
         active = false
         mainHandler.removeCallbacksAndMessages(null)
+        pendingRawUtteranceCallback = null
+        transcriber.setWakeWordBoostEnabled(true)
         transcriber.stop()
         _state.value = VoiceCommandUiState()
     }
@@ -141,8 +204,95 @@ class VoiceCommandManager @Inject constructor(
         }
     }
 
+    /**
+     * One-shot: the NEXT transcribed utterance is passed to [onUtterance]
+     * raw (trimmed, but not wake-word-checked or otherwise parsed),
+     * instead of going through the normal wake-word-gated command dispatch
+     * -- used for a short free-form dictation step inside a voice dialogue
+     * (e.g. "what should I name this route?" -> whatever the user says
+     * next is the name, without needing to repeat "NAVI"). Must be called
+     * from the main thread while already listening; overwrites any
+     * previously pending callback.
+     */
+    fun awaitNextRawUtterance(onUtterance: (String) -> Unit) {
+        // Free-form dictation (e.g. a route name) must NOT have the
+        // wake-word list ("navi"/"navy") boosted -- that boost is tuned for
+        // catching the wake word in ambient speech, but it skews
+        // transcription of unrelated words in a short one-off utterance,
+        // which is exactly what produced mismatched route names.
+        transcriber.setWakeWordBoostEnabled(false)
+        pendingRawUtteranceCallback = onUtterance
+    }
+
+    /** Cancels a pending [awaitNextRawUtterance] callback without waiting for an utterance -- e.g. the dialogue was abandoned. */
+    fun cancelPendingRawUtterance() {
+        pendingRawUtteranceCallback = null
+        transcriber.setWakeWordBoostEnabled(true)
+    }
+
+    /**
+     * Speaks [prompt] with the mic muted (so the batch transcriber can't
+     * pick up NAVI's own prompt audio and mistake it for the user's
+     * answer -- the same problem [promptRepeat] solves for its own
+     * internal prompt), then unmutes and starts listening for the NEXT
+     * utterance via [awaitNextRawUtterance] once the mute window has
+     * elapsed. For external callers that need a "ask a question via TTS,
+     * then capture the spoken answer" dialogue step -- Route Recording's
+     * "what should I name this route?" and Conversation Memory's "are you
+     * sure you want to delete everything?" both used to call
+     * [awaitNextRawUtterance] immediately after speaking, with no mute at
+     * all, so the mic reliably captured NAVI's own prompt as the "answer"
+     * instead of waiting for the user.
+     *
+     * The mute window is sized to [prompt]'s length, not a single fixed
+     * constant like [MUTE_DURING_PROMPT_MS] -- these dialogue prompts run
+     * noticeably longer than the short acknowledgements that constant was
+     * tuned for, and there's no actual TTS-completion callback wired up
+     * (see [Speaker]'s minimal interface) to know precisely when speech
+     * really finishes.
+     */
+    fun speakThenAwaitRawUtterance(prompt: String, onUtterance: (String) -> Unit) {
+        transcriber.setMuted(true)
+        speaker.speak(prompt, flushQueue = false, utteranceId = "voice_dialogue_prompt")
+        mainHandler.postDelayed({
+            transcriber.setMuted(false)
+            awaitNextRawUtterance(onUtterance)
+        }, estimatedSpeechDurationMs(prompt))
+    }
+
+    /** Rough length-based estimate of how long TTS will take to speak [text] -- see [speakThenAwaitRawUtterance]'s doc for why this isn't exact. */
+    private fun estimatedSpeechDurationMs(text: String): Long =
+        (text.length * MS_PER_CHARACTER_ESTIMATE).coerceIn(MIN_PROMPT_MUTE_MS, MAX_PROMPT_MUTE_MS)
+
+    /**
+     * Speaks [text] with the mic muted for roughly as long as it takes to
+     * say it, then unmutes -- for a one-off status/confirmation message
+     * that ISN'T asking a question (no [awaitNextRawUtterance] callback
+     * registered afterward; see [speakThenAwaitRawUtterance] for the
+     * "asking a question" case). Without this, e.g. Route Recording's "Rute
+     * X berhasil disimpan." confirmation got picked up by the still-active
+     * mic and transcribed as new (ambient, harmlessly ignored, but wasted)
+     * input the moment it finished saving -- same self-listening problem
+     * as the dialogue prompts, just on the "I'm done" side instead of the
+     * "here's my question" side.
+     */
+    fun speakMuted(text: String) {
+        transcriber.setMuted(true)
+        speaker.speak(text, flushQueue = false, utteranceId = "voice_muted_message")
+        mainHandler.postDelayed({ transcriber.setMuted(false) }, estimatedSpeechDurationMs(text))
+    }
+
     private fun handleFinalTranscript(text: String) {
         Log.i(TAG, "Transcript: \"$text\"")
+
+        val rawCallback = pendingRawUtteranceCallback
+        if (rawCallback != null) {
+            pendingRawUtteranceCallback = null
+            transcriber.setWakeWordBoostEnabled(true)
+            _state.update { it.copy(status = VoiceCommandStatus.LISTENING, message = null) }
+            rawCallback(text.trim())
+            return
+        }
 
         val command = VoiceCommandParser.extractCommand(text)
         when {
@@ -175,12 +325,12 @@ class VoiceCommandManager @Inject constructor(
      * only an audible acknowledgement that recognition worked.
      */
     private fun speakRecognizedCommand(command: String) {
-        val message = if (command.isBlank()) emptyCommandMessage(language) else recognizedCommandMessage(language, command)
-
         // Same reasoning as promptRepeat(): stop forwarding mic audio while
         // NAVI speaks, so it doesn't pick up its own voice as a new
         // "command".
+
         transcriber.setMuted(true)
+        val message = if (command.isBlank()) emptyCommandMessage(language) else recognizedCommandMessage(command, language)
         speaker.speak(message, flushQueue = false, utteranceId = "voice_command_recognized")
         mainHandler.postDelayed({ transcriber.setMuted(false) }, MUTE_DURING_PROMPT_MS)
     }
@@ -202,14 +352,16 @@ class VoiceCommandManager @Inject constructor(
         }, MUTE_DURING_PROMPT_MS)
     }
 
-    private fun recognizedCommandMessage(language: AnnouncementLanguage, command: String): String = when (language) {
-        AnnouncementLanguage.INDONESIAN -> "Saya dengar: $command"
-        AnnouncementLanguage.ENGLISH -> "I heard: $command"
-    }
 
     private fun emptyCommandMessage(language: AnnouncementLanguage): String = when (language) {
         AnnouncementLanguage.INDONESIAN -> "Ya? Silakan lanjutkan perintahnya."
         AnnouncementLanguage.ENGLISH -> "Yes? Go ahead with your command."
+    }
+
+    /** Audible "I heard: X" acknowledgement for a non-blank recognized command -- see [speakRecognizedCommand]'s doc. */
+    private fun recognizedCommandMessage(command: String, language: AnnouncementLanguage): String = when (language) {
+        AnnouncementLanguage.INDONESIAN -> "Saya dengar: $command"
+        AnnouncementLanguage.ENGLISH -> "I heard: $command"
     }
 
     private fun repeatPromptMessage(language: AnnouncementLanguage): String = when (language) {
@@ -222,10 +374,21 @@ class VoiceCommandManager @Inject constructor(
         AnnouncementLanguage.ENGLISH -> "Add your AssemblyAI API key in Settings to enable voice commands."
     }
 
+    /** Shown when Offline Mode is on but this device can't offer a verified-offline engine -- see [AndroidSpeechRecognizerTranscriber]'s class doc. */
+    private fun onDeviceUnsupportedMessage(language: AnnouncementLanguage): String = when (language) {
+        AnnouncementLanguage.INDONESIAN -> "Perintah suara butuh Android 12 ke atas untuk berfungsi dalam Mode Offline; perangkat ini tidak didukung."
+        AnnouncementLanguage.ENGLISH -> "Voice commands need Android 12+ to work in Offline Mode; this device isn't supported."
+    }
+
     private companion object {
         const val TAG = "VoiceCommandManager"
 
         /** How long to keep the mic muted after speaking a prompt/confirmation. */
-        const val MUTE_DURING_PROMPT_MS = 3000L
+        const val MUTE_DURING_PROMPT_MS = 2000L
+
+        /** Rough average speaking pace used to size [speakThenAwaitRawUtterance]'s mute window -- not exact, just a reasonable per-character estimate. */
+        const val MS_PER_CHARACTER_ESTIMATE = 90L
+        const val MIN_PROMPT_MUTE_MS = 2000L
+        const val MAX_PROMPT_MUTE_MS = 8000L
     }
 }

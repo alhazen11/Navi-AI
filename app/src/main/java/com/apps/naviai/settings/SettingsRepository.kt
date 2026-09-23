@@ -37,6 +37,7 @@ class SettingsRepository @Inject constructor(@ApplicationContext private val con
         val LLM_BASE_URL = stringPreferencesKey("llm_base_url")
         val LLM_API_KEY = stringPreferencesKey("llm_api_key")
         val LLM_MODEL = stringPreferencesKey("llm_model")
+        val OFFLINE_MODE_ENABLED = booleanPreferencesKey("offline_mode_enabled")
     }
 
     val settings: Flow<AppSettings> = context.settingsDataStore.data.map { prefs ->
@@ -58,7 +59,8 @@ class SettingsRepository @Inject constructor(@ApplicationContext private val con
             assemblyAiApiKey = prefs[Keys.ASSEMBLYAI_API_KEY] ?: defaults.assemblyAiApiKey,
             llmBaseUrl = prefs[Keys.LLM_BASE_URL] ?: defaults.llmBaseUrl,
             llmApiKey = prefs[Keys.LLM_API_KEY] ?: defaults.llmApiKey,
-            llmModel = prefs[Keys.LLM_MODEL] ?: defaults.llmModel
+            llmModel = prefs[Keys.LLM_MODEL] ?: defaults.llmModel,
+            offlineModeEnabled = prefs[Keys.OFFLINE_MODE_ENABLED] ?: defaults.offlineModeEnabled
         )
     }
 
@@ -86,6 +88,7 @@ class SettingsRepository @Inject constructor(@ApplicationContext private val con
     suspend fun setLlmModel(value: String?) = update {
         if (value.isNullOrBlank()) it.remove(Keys.LLM_MODEL) else it[Keys.LLM_MODEL] = value.trim()
     }
+    suspend fun setOfflineModeEnabled(value: Boolean) = update { it[Keys.OFFLINE_MODE_ENABLED] = value }
 
     suspend fun resetToDefaults() {
         context.settingsDataStore.edit { it.clear() }

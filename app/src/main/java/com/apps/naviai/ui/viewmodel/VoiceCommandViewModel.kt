@@ -21,6 +21,7 @@ class VoiceCommandViewModel @Inject constructor(
 
     @Volatile private var currentLanguage: AnnouncementLanguage = AnnouncementLanguage.INDONESIAN
     @Volatile private var currentApiKey: String? = null
+    @Volatile private var currentOfflineModeEnabled: Boolean = false
 
     /**
      * True once the UI has asked to listen (auto-start on permission grant,
@@ -40,6 +41,7 @@ class VoiceCommandViewModel @Inject constructor(
             settingsRepository.settings.collect { settings ->
                 currentLanguage = settings.speechLanguage
                 currentApiKey = settings.assemblyAiApiKey
+                currentOfflineModeEnabled = settings.offlineModeEnabled
                 if (listeningRequested) startListening()
             }
         }
@@ -48,7 +50,7 @@ class VoiceCommandViewModel @Inject constructor(
     /** Starts (or resumes) always-on listening. Must be called from the main thread (Compose event handlers already are). */
     fun startListening() {
         listeningRequested = true
-        voiceCommandManager.startContinuousListening(currentLanguage, currentApiKey)
+        voiceCommandManager.startContinuousListening(currentLanguage, currentApiKey, currentOfflineModeEnabled)
     }
 
     /** Pauses listening; no auto-restart happens again until [startListening] is called. */

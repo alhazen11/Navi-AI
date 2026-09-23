@@ -156,12 +156,34 @@ fun SettingsScreen(
             }
 
             item { HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp)) }
+            item { SectionTitle("Offline mode") }
+            item {
+                Text(
+                    "Almost everything in NAVI AI already runs fully on-device -- object detection, " +
+                        "distance/tracking/risk, spoken announcements, route recording & navigation, and " +
+                        "conversation memory never touch the network. Turning this on switches voice " +
+                        "commands to your phone's built-in offline speech recognizer (Android 12+) instead " +
+                        "of AssemblyAI, and blocks the LLM vision features below unless they're pointed at " +
+                        "a local server -- instead of letting anything fail on a bad connection or use data " +
+                        "you didn't expect:",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(bottom = 8.dp)
+                )
+            }
+            item {
+                SwitchSetting("Offline mode", settings.offlineModeEnabled, onCheckedChange = viewModel::setOfflineModeEnabled)
+            }
+            item { OfflineUnsupportedFeaturesList() }
+
+            item { HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp)) }
             item { SectionTitle("Voice commands") }
             item {
                 Text(
-                    "Voice commands use AssemblyAI's realtime speech-to-text over the internet -- " +
-                        "the only part of NAVI AI that leaves the device. Paste your own API key from " +
-                        "assemblyai.com below; it's stored only on this device.",
+                    "Voice commands normally use AssemblyAI's speech-to-text over the internet -- " +
+                        "paste your own API key from assemblyai.com below; it's stored only on this " +
+                        "device. Turning on Offline Mode above switches to your phone's built-in " +
+                        "on-device recognizer instead, and this key isn't needed.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(bottom = 8.dp)
@@ -224,6 +246,38 @@ fun SettingsScreen(
 @Composable
 private fun SectionTitle(text: String) {
     Text(text, style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 16.dp, bottom = 4.dp))
+}
+
+/**
+ * The two features in the app that would otherwise touch the network, and
+ * exactly what Offline Mode does about each -- everything else is already
+ * 100% on-device and keeps working unconditionally with the setting on.
+ */
+@Composable
+private fun OfflineUnsupportedFeaturesList() {
+    Column(modifier = Modifier.padding(top = 4.dp, bottom = 8.dp)) {
+        Text(
+            "What Offline Mode does to the two network-dependent features:",
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        listOf(
+            "Voice commands -- switches from AssemblyAI (cloud) to your phone's built-in " +
+                "on-device recognizer. Needs Android 12+; on older devices, or if the on-device " +
+                "recognizer doesn't support your selected language, voice commands are unavailable " +
+                "rather than risk a hidden network call.",
+            "Scene Understanding, Text Reading, Hazard Awareness's LLM check, and Object Search -- " +
+                "blocked only if your LLM endpoint (above) is a remote/cloud one. Point it at a local " +
+                "Ollama/LM Studio server on your own network and these keep working even in Offline Mode."
+        ).forEach { line ->
+            Text(
+                "•  $line",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp)
+            )
+        }
+    }
 }
 
 @Composable

@@ -47,5 +47,16 @@ data class AppSettings(
     /** Optional -- a local Ollama server typically needs no key; hosted providers do. */
     val llmApiKey: String? = null,
     /** Model name as the endpoint expects it, e.g. "llama3.2" for Ollama or "gpt-4o-mini" for OpenAI. */
-    val llmModel: String? = null
+    val llmModel: String? = null,
+    /**
+     * When true, every feature that needs a network round trip -- Voice
+     * Commands (AssemblyAI speech-to-text) and the LLM vision features
+     * (Scene Understanding, Text Reading, Hazard Awareness's LLM
+     * supplement, Object Search) -- refuses to run and surfaces a clear
+     * "unavailable in Offline Mode" message instead of attempting the
+     * call. Everything else (on-device detection/distance/tracking/risk,
+     * TTS, route recording & navigation, conversation memory) is
+     * unaffected, since none of it ever leaves the device.
+     */
+    val offlineModeEnabled: Boolean = false
 )

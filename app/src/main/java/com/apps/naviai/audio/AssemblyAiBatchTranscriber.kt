@@ -43,17 +43,24 @@ sealed interface BatchTranscriptEvent {
  * Captures microphone audio continuously, locally detects when the user has
  * said something (simple energy-based voice activity detection) and when
  * they've stopped, then sends *just that utterance* to AssemblyAI's
- * pre-recorded ("async") transcription API with `language_detection: true`.
+ * pre-recorded ("async") transcription API with an explicit `language_code`
+ * (the app's configured Settings language, ID or EN -- see [setLanguage]).
  *
  * This replaces a prior realtime-streaming-WebSocket implementation because
  * AssemblyAI's realtime streaming API does not support Indonesian at all
  * (confirmed against their docs -- `universal-streaming-multilingual`
  * covers only English/Spanish/German/French/Portuguese/Italian, and even
  * their best realtime model adds nowhere near full language coverage).
- * Indonesian *is* supported on the async endpoint used here, and
- * `language_detection` auto-picks between whichever language the user
- * actually spoke, so English and Indonesian commands both work without the
- * user choosing one in advance.
+ * Indonesian *is* supported on the async endpoint used here.
+ *
+ * `language_code` is used instead of `language_detection: true` (an
+ * earlier version of this class used auto-detect, "pick whichever language
+ * the user actually spoke"): auto-detection needs enough audio to work
+ * with, and a short utterance -- a one- or two-word route name, a plain
+ * "ya"/"yes" confirmation -- doesn't give it much to go on, so it would
+ * sometimes guess the wrong language entirely and transcribe nonsense. The
+ * app already knows which language the user configured in Settings; no
+ * need to guess it per utterance.
  *
  * The tradeoff is latency: each command takes roughly upload + processing
  * time (typically one to a few seconds) to come back, instead of
@@ -62,32 +69,72 @@ sealed interface BatchTranscriptEvent {
  * device buffer but isn't read) while a prior utterance is being
  * transcribed.
  */
-class AssemblyAiBatchTranscriber(private val httpClient: OkHttpClient) {
+class AssemblyAiBatchTranscriber(private val httpClient: OkHttpClient) : VoiceTranscriber {
+
+    override fun isSupported(): Boolean = true
 
     private var audioRecord: AudioRecord? = null
     private var audioJob: Job? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val muted = AtomicBoolean(false)
+
+    /**
+     * Off by default for a fresh/reconnected session, on for normal
+     * wake-word-gated listening -- see [setWakeWordBoostEnabled]'s doc for
+     * why this needs to be toggled off for raw-dictation utterances
+     * (a route name, memory content, a yes/no confirmation).
+     */
+    private val wakeWordBoostEnabled = AtomicBoolean(true)
+
     private var apiKey: String? = null
+    @Volatile private var language: AnnouncementLanguage = AnnouncementLanguage.INDONESIAN
 
     /**
      * Stops forwarding captured audio to the local VAD without tearing down
      * the mic. Used while NAVI is speaking (TTS) so it doesn't hear itself
      * and start "recording" its own voice as a new utterance.
      */
-    fun setMuted(value: Boolean) {
+    override fun setMuted(value: Boolean) {
         muted.set(value)
     }
 
-    /** Must hold RECORD_AUDIO; caller is responsible for the permission check. */
+    /**
+     * Keeps the `language_code` sent with each utterance's transcription
+     * request up to date. Safe to call at any time (active or not) so a
+     * mid-session language change in Settings takes effect on the very
+     * next utterance, not only after the next full reconnect.
+     */
+    override fun setLanguage(value: AnnouncementLanguage) {
+        language = value
+    }
+
+    /**
+     * Controls whether `word_boost` biases transcription toward "navi"/
+     * "navy" (see [createTranscript]). ON for normal wake-word-gated
+     * listening -- that bias is what fixed "NAVI" reliably being misheard
+     * as "Navy". Must be turned OFF for the single utterance expected
+     * right after a raw-dictation prompt (a route name, memory content, a
+     * yes/no confirmation): boosting "navi"/"navy" recognition likelihood
+     * has no business influencing a transcription that has nothing to do
+     * with the wake word, and was corrupting arbitrary free-form dictation
+     * -- e.g. a route name coming back garbled toward something
+     * "navi"/"navy"-sounding instead of what was actually said.
+     */
+    override fun setWakeWordBoostEnabled(value: Boolean) {
+        wakeWordBoostEnabled.set(value)
+    }
+
+    /** Must hold RECORD_AUDIO; caller is responsible for the permission check. [apiKey] must be non-blank -- callers only reach this once one is confirmed present (see [VoiceCommandManager]). */
     @SuppressLint("MissingPermission")
-    fun start(apiKey: String, onEvent: (BatchTranscriptEvent) -> Unit) {
+    override fun start(apiKey: String?, language: AnnouncementLanguage, onEvent: (BatchTranscriptEvent) -> Unit) {
         stop()
         this.apiKey = apiKey
+        this.language = language
+        wakeWordBoostEnabled.set(true)
         startAudioCapture(onEvent)
     }
 
-    fun stop() {
+    override fun stop() {
         audioJob?.cancel()
         audioJob = null
         stopAudioRecord()
@@ -217,15 +264,20 @@ class AssemblyAiBatchTranscriber(private val httpClient: OkHttpClient) {
     private fun createTranscript(apiKey: String, audioUrl: String): String {
         val payload = JSONObject().apply {
             put("audio_url", audioUrl)
-            // Auto-detect between whichever language the user actually
-            // spoke (Indonesian or English) instead of requiring them to
-            // pick one -- see class doc.
-            put("language_detection", true)
-            // Bias toward the wake word -- same rationale as the old
-            // realtime implementation's prompt biasing: on-device testing
-            // found "NAVI" reliably misheard as "Navy".
-            put("word_boost", JSONArray(listOf("navi", "navy")))
-            put("boost_param", "high")
+            // Explicit language_code (the app's configured Settings
+            // language), not language_detection -- see class doc for why
+            // auto-detect is unreliable for short utterances.
+            put("language_code", language.locale.language)
+            if (wakeWordBoostEnabled.get()) {
+                // Bias toward the wake word -- same rationale as the old
+                // realtime implementation's prompt biasing: on-device
+                // testing found "NAVI" reliably misheard as "Navy". Only
+                // applied while wake-word-boost is enabled -- see
+                // setWakeWordBoostEnabled's doc for why this must be off
+                // for raw-dictation captures.
+                put("word_boost", JSONArray(listOf("navi", "navy")))
+                put("boost_param", "high")
+            }
         }
         val request = Request.Builder()
             .url(TRANSCRIPT_ENDPOINT)

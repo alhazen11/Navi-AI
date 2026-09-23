@@ -154,19 +154,73 @@ private fun LoadingIndicator(label: String) {
 }
 
 @Composable
-private fun NaviAILogo(modifier: Modifier = Modifier) {
-    Canvas(modifier = modifier.size(140.dp)) {
+fun NaviAILogo(
+    modifier: Modifier = Modifier
+) {
+    Canvas(
+        modifier = modifier.size(180.dp)
+    ) {
+
         val width = size.width
         val height = size.height
+
         val gradient = Brush.linearGradient(
-            colors = listOf(NaviPrimary, Color(0xFF8DCBFA)),
+            colors = listOf(
+                Color(0xFF42A5F5),
+                Color(0xFF3155F5)
+            ),
             start = Offset(0f, 0f),
             end = Offset(width, height)
         )
-        val strokeWidth = width * 0.2f
-        drawLine(gradient, Offset(width * 0.25f, height * 0.70f), Offset(width * 0.25f, height * 0.30f), strokeWidth, cap = StrokeCap.Round)
-        drawLine(gradient, Offset(width * 0.25f, height * 0.30f), Offset(width * 0.73f, height * 0.70f), strokeWidth, cap = StrokeCap.Round)
-        drawLine(gradient, Offset(width * 0.73f, height * 0.30f), Offset(width * 0.73f, height * 0.70f), strokeWidth, cap = StrokeCap.Round)
-        drawCircle(brush = gradient, radius = width * 0.09f, center = Offset(width * 0.73f, height * 0.14f))
+
+        val strokeWidth = width * 0.22f
+
+        val path = Path().apply {
+
+            // Left vertical stroke
+            moveTo(width * 0.25f, height * 0.35f)
+
+            lineTo(width * 0.25f, height * 0.72f)
+
+            // Rounded left stroke
+            lineTo(width * 0.25f, height * 0.72f)
+        }
+
+        // Draw N using thick rounded lines
+        drawLine(
+            brush = gradient,
+            start = Offset(width * 0.25f, height * 0.70f),
+            end = Offset(width * 0.25f, height * 0.30f),
+            strokeWidth = strokeWidth,
+            cap = StrokeCap.Round
+        )
+
+        drawLine(
+            brush = gradient,
+            start = Offset(width * 0.25f, height * 0.30f),
+            end = Offset(width * 0.73f, height * 0.70f),
+            strokeWidth = strokeWidth,
+            cap = StrokeCap.Round
+        )
+
+        drawLine(
+            brush = Brush.linearGradient(
+                colors = listOf(
+                    Color(0xFF8DCBFA),
+                    Color(0xFF55A4F5)
+                )
+            ),
+            start = Offset(width * 0.73f, height * 0.30f),
+            end = Offset(width * 0.73f, height * 0.70f),
+            strokeWidth = strokeWidth,
+            cap = StrokeCap.Round
+        )
+
+        // Dot above right stroke
+        drawCircle(
+            brush = gradient,
+            radius = width * 0.10f,
+            center = Offset(width * 0.73f, height * 0.12f)
+        )
     }
 }

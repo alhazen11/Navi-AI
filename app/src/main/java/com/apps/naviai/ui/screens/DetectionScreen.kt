@@ -15,7 +15,10 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Cameraswitch
+import androidx.compose.material.icons.filled.FiberManualRecord
+import androidx.compose.material.icons.filled.Map
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Psychology
 import androidx.compose.material.icons.filled.RemoveRedEye
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
@@ -50,6 +53,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import kotlinx.coroutines.delay
 import com.apps.naviai.camera.CameraManager
 import com.apps.naviai.core.permissions.rememberCameraPermissionState
 import com.apps.naviai.detection.risk.RiskLevel
@@ -58,16 +62,31 @@ import com.apps.naviai.ui.components.DetectionOverlay
 import com.apps.naviai.ui.components.PerformanceStatsOverlay
 import com.apps.naviai.ui.components.RiskIndicator
 import com.apps.naviai.ui.components.VoiceCommandPanel
+import com.apps.naviai.ui.viewmodel.DetectionNavigationEvent
 import com.apps.naviai.ui.viewmodel.DetectionViewModel
 import com.apps.naviai.ui.viewmodel.HazardWarningStatus
 import com.apps.naviai.ui.viewmodel.ObjectSearchStatus
 import com.apps.naviai.ui.viewmodel.SceneDescriptionStatus
 import com.apps.naviai.ui.viewmodel.TextReadingStatus
 
+/**
+ * The app's single screen for every feature -- object detection plus every
+ * voice-triggered capability (Scene Understanding, Text Reading, Hazard
+ * Awareness, Object Search, Route Recording/Navigation, Conversation
+ * Memory). There used to be a separate HomeScreen/HomeViewModel hub;
+ * removed so everything lives in one place, with [onOpenRecording]/
+ * [onOpenSavedRoutes]/[onOpenMemory]/[onStartNavigation] reached either via
+ * the top-bar buttons or the matching voice command (see
+ * [DetectionViewModel.handleVoiceCommand], via [DetectionViewModel.navigationEvents]).
+ */
 @Composable
 fun DetectionScreen(
     onOpenSettings: () -> Unit,
     onOpenCalibration: () -> Unit,
+    onOpenRecording: () -> Unit,
+    onOpenSavedRoutes: () -> Unit,
+    onOpenMemory: () -> Unit,
+    onStartNavigation: (String) -> Unit,
     viewModel: DetectionViewModel = hiltViewModel()
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
@@ -75,6 +94,15 @@ fun DetectionScreen(
     val lifecycleOwner = LocalLifecycleOwner.current
     val haptics = LocalHapticFeedback.current
     val permission = rememberCameraPermissionState()
+
+    LaunchedEffect(Unit) {
+        viewModel.navigationEvents.collect { event ->
+            when (event) {
+                DetectionNavigationEvent.GoToRecording -> onOpenRecording()
+                is DetectionNavigationEvent.GoToNavigation -> onStartNavigation(event.routeName)
+            }
+        }
+    }
 
     val cameraManager = remember { CameraManager(context.applicationContext) }
     var previewView by remember { mutableStateOf<PreviewView?>(null) }
@@ -141,6 +169,24 @@ fun DetectionScreen(
             RiskIndicator(riskLevel = highestRisk)
 
             Row {
+                IconButton(
+                    onClick = onOpenRecording,
+                    modifier = Modifier.semantics { contentDescription = "Record a route" }
+                ) {
+                    Icon(Icons.Filled.FiberManualRecord, contentDescription = null, tint = Color.White)
+                }
+                IconButton(
+                    onClick = onOpenSavedRoutes,
+                    modifier = Modifier.semantics { contentDescription = "Saved routes" }
+                ) {
+                    Icon(Icons.Filled.Map, contentDescription = null, tint = Color.White)
+                }
+                IconButton(
+                    onClick = onOpenMemory,
+                    modifier = Modifier.semantics { contentDescription = "Memory" }
+                ) {
+                    Icon(Icons.Filled.Psychology, contentDescription = null, tint = Color.White)
+                }
                 IconButton(
                     onClick = onOpenCalibration,
                     modifier = Modifier.semantics { contentDescription = "Calibrate distance estimation" }
@@ -233,9 +279,35 @@ fun DetectionScreen(
     }
 }
 
+/**
+ * Auto-hides a result card [AUTO_HIDE_AFTER_MS] after it reaches a
+ * "terminal" state (a result/error is showing, not still loading) --
+ * without this, a Scene/Text/Object result just sits on screen forever
+ * until the next command replaces it, cluttering the view. Keyed on
+ * [status] itself: a genuinely new status (even a repeat of the same
+ * status object) restarts both the "visible" reset and the hide timer,
+ * so a fresh result is never hidden by a timer left over from a previous
+ * one. Doesn't touch the underlying ViewModel state -- this only affects
+ * whether the card is drawn, not [status] itself.
+ */
+@Composable
+private fun rememberAutoHideVisible(status: Any, isTerminal: Boolean): Boolean {
+    var visible by remember(status) { mutableStateOf(true) }
+    LaunchedEffect(status) {
+        if (isTerminal) {
+            delay(AUTO_HIDE_AFTER_MS)
+            visible = false
+        }
+    }
+    return visible
+}
+
+private const val AUTO_HIDE_AFTER_MS = 15_000L
+
 @Composable
 private fun SceneDescriptionCard(status: SceneDescriptionStatus, modifier: Modifier = Modifier) {
-    if (status == SceneDescriptionStatus.Idle) return
+    val isTerminal = status is SceneDescriptionStatus.Success || status is SceneDescriptionStatus.Failure
+    if (status == SceneDescriptionStatus.Idle || !rememberAutoHideVisible(status, isTerminal)) return
 
     Spacer(modifier = Modifier.size(16.dp))
     Column(
@@ -248,7 +320,7 @@ private fun SceneDescriptionCard(status: SceneDescriptionStatus, modifier: Modif
             is SceneDescriptionStatus.Processing -> Row(verticalAlignment = Alignment.CenterVertically) {
                 CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
                 Spacer(modifier = Modifier.size(12.dp))
-                Text("Analyzing surroundings…", style = MaterialTheme.typography.bodyMedium)
+                Text("Analyzing surroundings…", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             is SceneDescriptionStatus.Success -> Text(
                 status.text,
@@ -267,7 +339,8 @@ private fun SceneDescriptionCard(status: SceneDescriptionStatus, modifier: Modif
 
 @Composable
 private fun TextReadingCard(status: TextReadingStatus, modifier: Modifier = Modifier) {
-    if (status == TextReadingStatus.Idle) return
+    val isTerminal = status is TextReadingStatus.Success || status is TextReadingStatus.Failure
+    if (status == TextReadingStatus.Idle || !rememberAutoHideVisible(status, isTerminal)) return
 
     Spacer(modifier = Modifier.size(16.dp))
     Column(
@@ -280,7 +353,7 @@ private fun TextReadingCard(status: TextReadingStatus, modifier: Modifier = Modi
             is TextReadingStatus.Processing -> Row(verticalAlignment = Alignment.CenterVertically) {
                 CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
                 Spacer(modifier = Modifier.size(12.dp))
-                Text("Reading text…", style = MaterialTheme.typography.bodyMedium)
+                Text("Reading text…", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             is TextReadingStatus.Success -> Text(
                 status.text,
@@ -305,6 +378,8 @@ private fun HazardWarningCard(status: HazardWarningStatus, modifier: Modifier = 
     // asked for. It's silently retried on the next qualifying frame instead
     // (already logged for debugging in DetectionViewModel.checkForHazard).
     if (status == HazardWarningStatus.Idle || status is HazardWarningStatus.Failure) return
+    val isTerminal = status is HazardWarningStatus.Success
+    if (!rememberAutoHideVisible(status, isTerminal)) return
 
     Spacer(modifier = Modifier.size(16.dp))
     Column(
@@ -317,7 +392,7 @@ private fun HazardWarningCard(status: HazardWarningStatus, modifier: Modifier = 
             is HazardWarningStatus.Processing -> Row(verticalAlignment = Alignment.CenterVertically) {
                 CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
                 Spacer(modifier = Modifier.size(12.dp))
-                Text("Checking a possible obstacle…", style = MaterialTheme.typography.bodyMedium)
+                Text("Checking a possible obstacle…", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             is HazardWarningStatus.Success -> Text(
                 status.text,
@@ -331,7 +406,8 @@ private fun HazardWarningCard(status: HazardWarningStatus, modifier: Modifier = 
 
 @Composable
 private fun ObjectSearchCard(status: ObjectSearchStatus, modifier: Modifier = Modifier) {
-    if (status == ObjectSearchStatus.Idle) return
+    val isTerminal = status is ObjectSearchStatus.Success || status is ObjectSearchStatus.Failure
+    if (status == ObjectSearchStatus.Idle || !rememberAutoHideVisible(status, isTerminal)) return
 
     Spacer(modifier = Modifier.size(16.dp))
     Column(
@@ -344,7 +420,7 @@ private fun ObjectSearchCard(status: ObjectSearchStatus, modifier: Modifier = Mo
             is ObjectSearchStatus.Processing -> Row(verticalAlignment = Alignment.CenterVertically) {
                 CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
                 Spacer(modifier = Modifier.size(12.dp))
-                Text("Searching…", style = MaterialTheme.typography.bodyMedium)
+                Text("Searching…", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             is ObjectSearchStatus.Success -> Text(
                 status.text,
