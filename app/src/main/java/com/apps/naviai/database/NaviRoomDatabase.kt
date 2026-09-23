@@ -9,12 +9,13 @@ import com.apps.naviai.memory.ConversationMemoryEntity
 @Database(
     entities = [RouteEntity::class, RoutePointEntity::class, ConversationMemoryEntity::class],
     // Bumped from 1 (route recording/navigation only) to 2 for the added
-    // conversation-memory table -- see DatabaseModule's
+    // conversation-memory table, then to 3 for RouteEntity.name's new
+    // unique (COLLATE NOCASE) index -- see DatabaseModule's
     // fallbackToDestructiveMigration(): fine during development (nothing
     // has shipped/needs its data preserved across this bump yet), but a
     // real Migration would be needed before a release build ever reaches
-    // a device with an existing v1 database.
-    version = 2,
+    // a device with an existing pre-v3 database.
+    version = 3,
     exportSchema = false
 )
 @TypeConverters(Converters::class)

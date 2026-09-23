@@ -106,14 +106,19 @@ class NavigationController @Inject constructor(
      * on the recording side.
      */
     fun start(routeName: String) {
-        // job != null (not just isActive) guards against a second start()
-        // call arriving before the first GPS fix ever comes in -- isActive
-        // only flips true once handleEvent's first publish() runs, so
-        // relying on it alone left a window where a fast double-start (e.g.
-        // a double-tap, or the service's onStartCommand firing twice)
-        // reassigned job/voiceJob without cancelling the originals, leaking
-        // the first run's coroutines and doubling GPS/voice/TTS activity.
-        if (isActive || job != null) return
+        // job?.isActive (not just the isActive PROPERTY above) guards
+        // against a second start() call arriving before the first GPS fix
+        // ever comes in -- the isActive property only flips true once
+        // handleEvent's first publish() runs, so relying on it alone left a
+        // window where a fast double-start (e.g. a double-tap, or the
+        // service's onStartCommand firing twice) reassigned job/voiceJob
+        // without cancelling the originals, leaking the first run's
+        // coroutines and doubling GPS/voice/TTS activity. Checking
+        // job.isActive rather than just `job != null` matters too: job is
+        // never reset to null after finishing on its own (route-not-found),
+        // only when stop() cancels it, so `!= null` would permanently block
+        // ever starting again after a single route-not-found failure.
+        if (isActive || job?.isActive == true) return
         if (!LocationPermission.isGranted(context)) {
             ttsManager.speak(NavigationAnnouncements.locationPermissionRequired(language), flushQueue = true, utteranceId = "nav_permission_required")
             return
