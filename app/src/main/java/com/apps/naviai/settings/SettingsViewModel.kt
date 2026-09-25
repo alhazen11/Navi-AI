@@ -3,6 +3,7 @@ package com.apps.naviai.settings
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.apps.naviai.audio.AnnouncementLanguage
+import com.apps.naviai.core.common.NetworkMonitor
 import com.apps.naviai.data.calibration.CalibrationData
 import com.apps.naviai.data.calibration.CalibrationRepository
 import com.apps.naviai.detection.detector.ObjectDetector
@@ -23,7 +24,18 @@ import javax.inject.Inject
 data class SettingsUiState(
     val settings: AppSettings = AppSettings(),
     val calibration: CalibrationData? = null,
-    val isVulkanSupported: Boolean = false
+    val isVulkanSupported: Boolean = false,
+    /**
+     * What the Offline Mode switch actually shows: [AppSettings.offlineModeEnabled]
+     * OR there's genuinely no internet right now (see [NetworkMonitor]) --
+     * the saved preference itself is never overwritten by this (see
+     * [SettingsViewModel.setOfflineModeEnabled]), so the switch reverts to
+     * showing whatever the user actually chose the moment connectivity
+     * comes back, with nothing to undo.
+     */
+    val effectiveOfflineModeEnabled: Boolean = false,
+    /** True when [effectiveOfflineModeEnabled] is on ONLY because of no internet, not because the user's own saved preference is -- the switch is shown disabled in this state (see SettingsScreen), since toggling it wouldn't change anything real while there's still no connectivity. */
+    val offlineModeForcedByNoInternet: Boolean = false
 )
 
 sealed interface LlmConnectionTestState {
@@ -38,14 +50,23 @@ class SettingsViewModel @Inject constructor(
     private val settingsRepository: SettingsRepository,
     private val calibrationRepository: CalibrationRepository,
     private val objectDetector: ObjectDetector,
-    private val llmClient: LlmClient
+    private val llmClient: LlmClient,
+    private val networkMonitor: NetworkMonitor
 ) : ViewModel() {
 
     val uiState: StateFlow<SettingsUiState> = combine(
         settingsRepository.settings,
-        calibrationRepository.calibration
-    ) { settings, calibration ->
-        SettingsUiState(settings, calibration, objectDetector.isVulkanSupported())
+        calibrationRepository.calibration,
+        networkMonitor.hasInternetFlow
+    ) { settings, calibration, hasInternet ->
+        val forcedByNoInternet = !settings.offlineModeEnabled && !hasInternet
+        SettingsUiState(
+            settings = settings,
+            calibration = calibration,
+            isVulkanSupported = objectDetector.isVulkanSupported(),
+            effectiveOfflineModeEnabled = settings.offlineModeEnabled || forcedByNoInternet,
+            offlineModeForcedByNoInternet = forcedByNoInternet
+        )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), SettingsUiState())
 
     private val _llmTestState = MutableStateFlow<LlmConnectionTestState>(LlmConnectionTestState.Idle)

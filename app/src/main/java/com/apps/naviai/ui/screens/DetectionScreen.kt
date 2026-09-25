@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Cameraswitch
 import androidx.compose.material.icons.filled.FiberManualRecord
 import androidx.compose.material.icons.filled.Map
@@ -87,6 +88,7 @@ fun DetectionScreen(
     onOpenSavedRoutes: () -> Unit,
     onOpenMemory: () -> Unit,
     onStartNavigation: (String) -> Unit,
+    onOpenProMode: () -> Unit,
     viewModel: DetectionViewModel = hiltViewModel()
 ) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
@@ -100,6 +102,7 @@ fun DetectionScreen(
             when (event) {
                 DetectionNavigationEvent.GoToRecording -> onOpenRecording()
                 is DetectionNavigationEvent.GoToNavigation -> onStartNavigation(event.routeName)
+                DetectionNavigationEvent.GoToProMode -> onOpenProMode()
             }
         }
     }
@@ -159,16 +162,22 @@ fun DetectionScreen(
             }
         }
 
-        // Top bar: risk indicator + settings/calibration access.
-        Row(
-            modifier = Modifier.fillMaxWidth().padding(16.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            val highestRisk = uiState.trackedObjects.maxByOrNull { it.riskLevel.priority }?.riskLevel ?: RiskLevel.SAFE
-            RiskIndicator(riskLevel = highestRisk)
+        // Top bar: risk indicator on its own row, every screen-navigation
+        // icon button on a separate row beneath it -- kept apart (rather
+        // than one SpaceBetween row) so the risk indicator, the one thing
+        // here that's actually safety-relevant, doesn't visually compete
+        // with a row of six unrelated navigation icons.
+        Column(modifier = Modifier.fillMaxWidth().padding(16.dp)) {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start, verticalAlignment = Alignment.CenterVertically) {
+                val highestRisk = uiState.trackedObjects.maxByOrNull { it.riskLevel.priority }?.riskLevel ?: RiskLevel.SAFE
+                RiskIndicator(riskLevel = highestRisk)
+                Spacer(modifier = Modifier.size(12.dp))
+                PerformanceStatsOverlay(stats = uiState.performanceStats)
+            }
 
-            Row {
+            Spacer(modifier = Modifier.size(8.dp))
+
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.Start) {
                 IconButton(
                     onClick = onOpenRecording,
                     modifier = Modifier.semantics { contentDescription = "Record a route" }
@@ -188,6 +197,12 @@ fun DetectionScreen(
                     Icon(Icons.Filled.Psychology, contentDescription = null, tint = Color.White)
                 }
                 IconButton(
+                    onClick = onOpenProMode,
+                    modifier = Modifier.semantics { contentDescription = "Pro Mode: free-form conversation" }
+                ) {
+                    Icon(Icons.Filled.AutoAwesome, contentDescription = null, tint = Color.White)
+                }
+                IconButton(
                     onClick = onOpenCalibration,
                     modifier = Modifier.semantics { contentDescription = "Calibrate distance estimation" }
                 ) {
@@ -201,11 +216,6 @@ fun DetectionScreen(
                 }
             }
         }
-
-        PerformanceStatsOverlay(
-            stats = uiState.performanceStats,
-            modifier = Modifier.align(Alignment.TopStart).padding(top = 72.dp, start = 16.dp)
-        )
 
         // Bottom stack: voice command panel, controls, then the detail card --
         // grouped in one Column so they lay out top-to-bottom without manual

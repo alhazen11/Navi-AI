@@ -20,6 +20,7 @@ import com.apps.naviai.camera.ImageUtils
 import com.apps.naviai.core.common.InferenceDispatcher
 import com.apps.naviai.core.common.IoDispatcher
 import com.apps.naviai.core.common.LocalEndpoint
+import com.apps.naviai.core.common.NetworkMonitor
 import com.apps.naviai.core.performance.PerformanceMonitor
 import com.apps.naviai.core.performance.PerformanceStats
 import com.apps.naviai.data.calibration.CalibrationData
@@ -57,6 +58,7 @@ import com.apps.naviai.scene.ScenePromptBuilder
 import com.apps.naviai.scene.TextReadingMatcher
 import com.apps.naviai.scene.TextReadingPromptBuilder
 import com.apps.naviai.settings.SettingsRepository
+import com.apps.naviai.voiceagent.ProModeCommandMatcher
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineDispatcher
@@ -106,6 +108,7 @@ sealed interface ObjectSearchStatus {
 sealed interface DetectionNavigationEvent {
     data object GoToRecording : DetectionNavigationEvent
     data class GoToNavigation(val routeName: String) : DetectionNavigationEvent
+    data object GoToProMode : DetectionNavigationEvent
 }
 
 data class DetectionUiState(
@@ -141,6 +144,7 @@ class DetectionViewModel @Inject constructor(
     private val settingsRepository: SettingsRepository,
     private val calibrationRepository: CalibrationRepository,
     private val voiceCommandManager: VoiceCommandManager,
+    private val networkMonitor: NetworkMonitor,
     private val llmClient: LlmClient,
     private val routeRecorder: RouteRecorder,
     private val routeRepository: RouteRepository,
@@ -295,6 +299,14 @@ class DetectionViewModel @Inject constructor(
      *    "ada X" question), checked last as the catch-all.
      */
     private suspend fun handleVoiceCommand(command: String) {
+        if (ProModeCommandMatcher.isEnter(command)) {
+            _navigationEvents.tryEmit(DetectionNavigationEvent.GoToProMode)
+            return
+        }
+
+        // Not wrapped in try/catch here -- the caller (the voiceCommandManager
+        // state collector, see init{}) already contains any exception from
+        // this whole function so one bad command can't kill the collector.
         if (memoryManager.handleCommand(command)) return
 
         if (RouteRecordingMatcher.isStart(command)) {
@@ -347,13 +359,17 @@ class DetectionViewModel @Inject constructor(
     }
 
     /**
-     * True when Offline Mode should block a call to [baseUrl]: the setting
-     * is on AND the endpoint isn't a local/LAN server (see [LocalEndpoint])
-     * -- a local Ollama/LM Studio setup never leaves the device/LAN, so it
-     * stays usable in Offline Mode; a hosted endpoint does not.
+     * True when a call to [baseUrl] should be blocked: Offline Mode is
+     * manually on, OR there's genuinely no internet connectivity right now
+     * (see [NetworkMonitor], same "effective offline" idea
+     * [com.apps.naviai.audio.VoiceCommandManager] uses for voice commands)
+     * -- either way, AND the endpoint isn't a local/LAN server (see
+     * [LocalEndpoint]): a local Ollama/LM Studio setup never leaves the
+     * device/LAN, so it stays usable in both cases; a hosted endpoint does
+     * not.
      */
     private fun offlineModeBlocksLlm(baseUrl: String): Boolean =
-        currentSettings.offlineModeEnabled && !LocalEndpoint.isLocal(baseUrl)
+        (currentSettings.offlineModeEnabled || !networkMonitor.hasInternet()) && !LocalEndpoint.isLocal(baseUrl)
 
     private fun offlineModeMessage(language: AnnouncementLanguage): String = when (language) {
         AnnouncementLanguage.INDONESIAN -> "Fitur ini butuh internet dan dinonaktifkan saat Mode Offline aktif."
@@ -552,15 +568,24 @@ class DetectionViewModel @Inject constructor(
         AnnouncementLanguage.ENGLISH -> "Read this text"
     }
 
+    /** Whether [checkForHazard] can actually run right now -- an LLM endpoint is configured AND Offline Mode doesn't block it. (The separate speak/stay-silent decision for [AnnouncementManager]'s own on-device pass, at its call site above, deliberately does NOT reuse this -- Offline Mode always keeps that one speaking regardless, even if a local/LAN LLM happens to make this true; see that call site's comment for why.) */
+    private fun llmHazardSupplementAvailable(): Boolean {
+        val baseUrl = currentSettings.llmBaseUrl
+        val model = currentSettings.llmModel
+        if (baseUrl.isNullOrBlank() || model.isNullOrBlank()) return false
+        return !offlineModeBlocksLlm(baseUrl)
+    }
+
     /**
      * Hazard Awareness: unlike Scene Understanding/Text Reading, this is
      * never triggered by the user -- [HazardTrigger] fires it automatically
      * whenever a large object looks like it's blocking the walking path.
      * Deliberately silent on failure (only logged + reflected in UI state,
      * no spoken error) since the user never asked for this particular
-     * check; the fast on-device [AnnouncementManager] path remains the
-     * primary, low-latency safety mechanism regardless of whether this
-     * LLM-based supplement succeeds.
+     * check. [AnnouncementManager]'s own fast on-device pass is the
+     * fallback whenever this supplement isn't available at all (see
+     * [llmHazardSupplementAvailable]) -- hazard announcements are never
+     * silently lost, only handed off to whichever of the two can actually run.
      */
     private fun checkForHazard(trackedObjects: List<TrackedObject>, frameWidth: Int, frameHeight: Int, frame: FrameInput, nowMs: Long) {
         if (!currentSettings.enableVoiceAssistance || hazardCheckInFlight) return
@@ -737,7 +762,19 @@ class DetectionViewModel @Inject constructor(
         val withRisk = tracked.map { it.copy(riskLevel = riskAssessmentEngine.assess(it, uprightWidth)) }
 
         if (currentSettings.enableVoiceAssistance && currentSettings.enableTracking) {
-            announcementManager.evaluate(withRisk, currentSettings.speechLanguage, nowMs) { trackingId, atMs ->
+            // "Effectively offline" (Offline Mode ON, OR genuinely no internet right now -- see
+            // NetworkMonitor/offlineModeBlocksLlm) always speaks here, full stop -- even if a
+            // local/LAN LLM happens to be configured and reachable either way, so checkForHazard
+            // (below) can technically still run, its narrower "blocking hazard" trigger is not a
+            // substitute for this pass's broader risk-level coverage, and neither Offline Mode nor
+            // a dead connection should ever mean reduced hazard coverage. Only when actually online
+            // with real connectivity AND an LLM is configured does this stay silent in favor of
+            // that richer description -- otherwise (online with no LLM set up) it speaks for itself
+            // too, so hazard announcements are never silently lost either way.
+            val effectivelyOffline = currentSettings.offlineModeEnabled || !networkMonitor.hasInternet()
+            val llmConfigured = !currentSettings.llmBaseUrl.isNullOrBlank() && !currentSettings.llmModel.isNullOrBlank()
+            val speak = effectivelyOffline || !llmConfigured
+            announcementManager.evaluate(withRisk, currentSettings.speechLanguage, nowMs, speak = speak) { trackingId, atMs ->
                 objectTracker.markAnnounced(trackingId, atMs)
             }
         }

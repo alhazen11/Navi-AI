@@ -1,9 +1,11 @@
 package com.apps.naviai.audio
 
 import android.content.Context
+import android.net.ConnectivityManager
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
+import com.apps.naviai.core.common.NetworkMonitor
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -74,10 +76,24 @@ data class VoiceCommandUiState(
  * active. Switching engines always stops the previously active one first
  * (see [startContinuousListening]) -- only one may hold the microphone at
  * a time.
+ *
+ * **Automatic fallback when there's no internet**: the *effective* offline
+ * decision is `offlineModeEnabled || !`[NetworkMonitor.hasInternet] (see
+ * [effectiveOfflineMode]), not just the raw setting -- a user who never
+ * turned Offline Mode on but genuinely has no connectivity right now (a
+ * dead zone, airplane mode, walking into a basement) gets the same
+ * on-device fallback rather than a cloud engine that would just fail/hang.
+ * [networkMonitor]'s listener re-runs [startContinuousListening] with
+ * whatever language/API key/setting were last used whenever connectivity
+ * actually flips (see [onConnectivityChanged]) -- this reacts to
+ * connectivity changing *during* an active session, not only at the moment
+ * listening starts, since that's the realistic way connectivity changes
+ * for someone moving around outdoors.
  */
 @Singleton
 class VoiceCommandManager @Inject constructor(
     private val speaker: Speaker,
+    private val networkMonitor: NetworkMonitor,
     httpClient: OkHttpClient,
     @ApplicationContext context: Context
 ) {
@@ -97,6 +113,25 @@ class VoiceCommandManager @Inject constructor(
     private var recognizedEventCounter = 0L
     private var pendingRawUtteranceCallback: ((String) -> Unit)? = null
 
+    // ---- Automatic no-internet fallback -- see the class doc's matching section. ----
+    /** Exactly the arguments [startContinuousListening] was last called with, unconditionally -- unlike [apiKey] (only meaningfully updated on the cloud-engine branch), these let [onConnectivityChanged] reconstruct the same call regardless of which engine was active at the time. */
+    private var lastLanguageArgument = AnnouncementLanguage.INDONESIAN
+    private var lastApiKeyArgument: String? = null
+    private var lastOfflineModeSetting = false
+    private val networkCallback: ConnectivityManager.NetworkCallback? =
+        networkMonitor.registerListener { mainHandler.post { onConnectivityChanged() } }
+
+    /** True when Offline Mode should actually be treated as on right now -- the user's own setting, OR there's genuinely no internet connectivity regardless of what they set. */
+    private fun effectiveOfflineMode(offlineModeEnabled: Boolean): Boolean =
+        offlineModeEnabled || !networkMonitor.hasInternet()
+
+    /** Connectivity actually changed (see [networkMonitor]'s listener) -- re-run with whatever this was last started with, so an active session picks up the new effective engine choice without the caller needing to do anything. */
+    private fun onConnectivityChanged() {
+        if (!active) return
+        Log.d(TAG, "Connectivity changed, hasInternet=${networkMonitor.hasInternet()} -- re-evaluating voice command engine")
+        startContinuousListening(lastLanguageArgument, lastApiKeyArgument, lastOfflineModeSetting)
+    }
+
     /**
      * Must be called from the main thread. Idempotent while already active
      * with the same key/engine -- but if [apiKey] differs from the one
@@ -105,28 +140,36 @@ class VoiceCommandManager @Inject constructor(
      * user edited it), reconnects with the new one instead of silently
      * no-oping.
      *
-     * [offlineModeEnabled] picks the engine (see the class doc's "Engine
-     * switching" note): true routes through [onDeviceTranscriber]
+     * [offlineModeEnabled] is the raw Settings toggle, not necessarily the
+     * engine actually used -- see [effectiveOfflineMode] (the class doc's
+     * "Automatic fallback" section): true, OR no real internet connectivity
+     * right now regardless of the toggle, routes through [onDeviceTranscriber]
      * ([AndroidSpeechRecognizerTranscriber], Android 12+ only -- see its
-     * class doc for why older devices can't offer a verified-offline
-     * engine at all); false uses [cloudTranscriber] as before. A change
-     * either way always stops whichever engine was previously active first
-     * -- only one may hold the microphone at a time.
+     * class doc for why older devices can't offer a verified-offline engine
+     * at all); otherwise uses [cloudTranscriber] as before. A change either
+     * way always stops whichever engine was previously active first -- only
+     * one may hold the microphone at a time.
      */
     fun startContinuousListening(language: AnnouncementLanguage, apiKey: String?, offlineModeEnabled: Boolean = false) {
         this.language = language
+        lastLanguageArgument = language
+        lastApiKeyArgument = apiKey
+        lastOfflineModeSetting = offlineModeEnabled
 
-        val targetTranscriber: VoiceTranscriber = if (offlineModeEnabled) onDeviceTranscriber else cloudTranscriber
+        val effectiveOffline = effectiveOfflineMode(offlineModeEnabled)
+        val fallenBackDueToNoInternet = !offlineModeEnabled && effectiveOffline
+        val targetTranscriber: VoiceTranscriber = if (effectiveOffline) onDeviceTranscriber else cloudTranscriber
         if (targetTranscriber !== transcriber) {
             transcriber.stop()
             transcriber = targetTranscriber
             active = false
         }
 
-        if (offlineModeEnabled) {
+        if (effectiveOffline) {
             if (!transcriber.isSupported()) {
                 active = false
-                _state.value = VoiceCommandUiState(status = VoiceCommandStatus.UNAVAILABLE, message = onDeviceUnsupportedMessage(language))
+                val message = if (fallenBackDueToNoInternet) noInternetUnsupportedMessage(language) else onDeviceUnsupportedMessage(language)
+                _state.value = VoiceCommandUiState(status = VoiceCommandStatus.UNAVAILABLE, message = message)
                 return
             }
             if (active) {
@@ -137,6 +180,7 @@ class VoiceCommandManager @Inject constructor(
                 return
             }
             active = true
+            if (fallenBackDueToNoInternet) Log.d(TAG, "No internet connectivity detected -- using on-device recognizer even though Offline Mode isn't manually on")
             transcriber.start(null, language) { event -> mainHandler.post { handleEvent(event) } }
             return
         }
@@ -330,8 +374,9 @@ class VoiceCommandManager @Inject constructor(
         // "command".
 
         transcriber.setMuted(true)
-        val message = if (command.isBlank()) emptyCommandMessage(language) else recognizedCommandMessage(command, language)
-        speaker.speak(message, flushQueue = false, utteranceId = "voice_command_recognized")
+        if (command.isBlank()){
+            speaker.speak( emptyCommandMessage(language), flushQueue = false, utteranceId = "voice_command_recognized")
+        }
         mainHandler.postDelayed({ transcriber.setMuted(false) }, MUTE_DURING_PROMPT_MS)
     }
 
@@ -358,12 +403,6 @@ class VoiceCommandManager @Inject constructor(
         AnnouncementLanguage.ENGLISH -> "Yes? Go ahead with your command."
     }
 
-    /** Audible "I heard: X" acknowledgement for a non-blank recognized command -- see [speakRecognizedCommand]'s doc. */
-    private fun recognizedCommandMessage(command: String, language: AnnouncementLanguage): String = when (language) {
-        AnnouncementLanguage.INDONESIAN -> "Saya dengar: $command"
-        AnnouncementLanguage.ENGLISH -> "I heard: $command"
-    }
-
     private fun repeatPromptMessage(language: AnnouncementLanguage): String = when (language) {
         AnnouncementLanguage.INDONESIAN -> "Maaf, tidak terdengar jelas. Silakan ulangi, mulai dengan kata NAVI."
         AnnouncementLanguage.ENGLISH -> "Sorry, I didn't catch that clearly. Please repeat, starting with NAVI."
@@ -378,6 +417,12 @@ class VoiceCommandManager @Inject constructor(
     private fun onDeviceUnsupportedMessage(language: AnnouncementLanguage): String = when (language) {
         AnnouncementLanguage.INDONESIAN -> "Perintah suara butuh Android 12 ke atas untuk berfungsi dalam Mode Offline; perangkat ini tidak didukung."
         AnnouncementLanguage.ENGLISH -> "Voice commands need Android 12+ to work in Offline Mode; this device isn't supported."
+    }
+
+    /** Same on-device-unsupported situation as [onDeviceUnsupportedMessage], but reached via the automatic no-internet fallback rather than Offline Mode being manually on -- worded so the user isn't confused about a setting they never touched. */
+    private fun noInternetUnsupportedMessage(language: AnnouncementLanguage): String = when (language) {
+        AnnouncementLanguage.INDONESIAN -> "Tidak ada koneksi internet, dan perintah suara offline butuh Android 12 ke atas; perangkat ini tidak didukung."
+        AnnouncementLanguage.ENGLISH -> "No internet connection, and offline voice commands need Android 12+; this device isn't supported."
     }
 
     private companion object {

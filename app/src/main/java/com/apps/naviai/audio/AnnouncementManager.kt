@@ -24,6 +24,13 @@ class AnnouncementManager @Inject constructor(private val tts: Speaker) {
     var minRiskToAnnounce: RiskLevel = RiskLevel.LOW
 
     /**
+     * @param speak When false, announcements are still computed (and
+     *   [onAnnounced] still fires, so cooldowns keep advancing normally) but
+     *   never actually spoken -- for when the caller has a richer
+     *   alternative already covering the same ground, e.g.
+     *   [com.apps.naviai.ui.viewmodel.DetectionViewModel]'s LLM-based Hazard
+     *   Awareness supplement, so the user doesn't hear two overlapping
+     *   voices describe the same object.
      * @param onAnnounced invoked once per object actually spoken, so the
      *   caller can persist the timestamp back onto the track (via
      *   ObjectTracker.markAnnounced) for future cooldown checks.
@@ -32,6 +39,7 @@ class AnnouncementManager @Inject constructor(private val tts: Speaker) {
         trackedObjects: List<TrackedObject>,
         language: AnnouncementLanguage,
         nowMs: Long,
+        speak: Boolean = true,
         onAnnounced: (trackingId: Int, atMs: Long) -> Unit
     ): List<Announcement> {
         val toAnnounce = trackedObjects
@@ -53,7 +61,7 @@ class AnnouncementManager @Inject constructor(private val tts: Speaker) {
 
         announcements.forEach { announcement ->
             onAnnounced(announcement.trackingId, nowMs)
-            //tts.speak(announcement.text, announcement.isUrgent, "track_${announcement.trackingId}_$nowMs")
+            if (speak) tts.speak(announcement.text, announcement.isUrgent, "track_${announcement.trackingId}_$nowMs")
         }
 
         return announcements

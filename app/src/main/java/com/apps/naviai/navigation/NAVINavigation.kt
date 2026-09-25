@@ -11,6 +11,7 @@ import com.apps.naviai.ui.screens.CalibrationScreen
 import com.apps.naviai.ui.screens.DetectionScreen
 import com.apps.naviai.ui.screens.MemoryScreen
 import com.apps.naviai.ui.screens.NavigationScreen
+import com.apps.naviai.ui.screens.ProModeScreen
 import com.apps.naviai.ui.screens.RecordingScreen
 import com.apps.naviai.ui.screens.SavedRoutesScreen
 import com.apps.naviai.ui.screens.SettingsScreen
@@ -26,6 +27,7 @@ object NAVIDestinations {
     const val RECORDING = "recording"
     const val SAVED_ROUTES = "saved_routes"
     const val MEMORY = "memory"
+    const val PRO_MODE = "pro_mode"
     const val ROUTE_NAME_ARG = "routeName"
     const val NAVIGATION = "navigation/{$ROUTE_NAME_ARG}"
 
@@ -54,8 +56,12 @@ fun NAVINavHost(navController: NavHostController = rememberNavController()) {
                 onOpenRecording = { navController.navigate(NAVIDestinations.RECORDING) },
                 onOpenSavedRoutes = { navController.navigate(NAVIDestinations.SAVED_ROUTES) },
                 onOpenMemory = { navController.navigate(NAVIDestinations.MEMORY) },
-                onStartNavigation = { routeName -> navController.navigate(NAVIDestinations.navigationRoute(routeName)) }
+                onStartNavigation = { routeName -> navController.navigate(NAVIDestinations.navigationRoute(routeName)) },
+                onOpenProMode = { navController.navigate(NAVIDestinations.PRO_MODE) }
             )
+        }
+        composable(NAVIDestinations.PRO_MODE) {
+            ProModeScreen(onBack = { navController.popBackStack() })
         }
         composable(NAVIDestinations.SETTINGS) {
             SettingsScreen(

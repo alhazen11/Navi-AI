@@ -101,6 +101,7 @@ class AndroidSpeechRecognizerTranscriber(private val context: Context) : VoiceTr
             return
         }
 
+        Log.d(TAG, "start() -- creating on-device recognizer, language=${language.locale.toLanguageTag()}")
         val instance = SpeechRecognizer.createOnDeviceSpeechRecognizer(context)
         instance.setRecognitionListener(createListener())
         recognizer = instance
@@ -124,6 +125,7 @@ class AndroidSpeechRecognizerTranscriber(private val context: Context) : VoiceTr
         if (!active || muted) return
         val instance = recognizer ?: return
         runCatching { instance.startListening(buildIntent()) }
+            .onSuccess { Log.d(TAG, "startListening() called") }
             .onFailure { t ->
                 Log.w(TAG, "startListening failed, retrying shortly", t)
                 mainHandler.postDelayed({ restartListening() }, RETRY_DELAY_MS)
@@ -146,21 +148,27 @@ class AndroidSpeechRecognizerTranscriber(private val context: Context) : VoiceTr
 
     private fun createListener(): RecognitionListener = object : RecognitionListener {
         override fun onReadyForSpeech(params: Bundle?) {
+            Log.d(TAG, "onReadyForSpeech")
             onEvent?.invoke(BatchTranscriptEvent.Listening)
         }
 
-        override fun onBeginningOfSpeech() = Unit
+        override fun onBeginningOfSpeech() {
+            Log.d(TAG, "onBeginningOfSpeech -- mic picked up sound")
+        }
         override fun onRmsChanged(rmsdB: Float) = Unit
         override fun onBufferReceived(buffer: ByteArray?) = Unit
 
         override fun onEndOfSpeech() {
+            Log.d(TAG, "onEndOfSpeech")
             onEvent?.invoke(BatchTranscriptEvent.Transcribing)
         }
 
         override fun onError(error: Int) = handleError(error)
 
         override fun onResults(results: Bundle?) {
-            val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull()
+            val allResults = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+            val text = allResults?.firstOrNull()
+            Log.d(TAG, "onResults: $allResults")
             if (!text.isNullOrBlank()) onEvent?.invoke(BatchTranscriptEvent.Result(text))
             // Posted, not called inline -- restarting from within the very
             // callback the recognizer just delivered is flaky on some OEM
@@ -173,11 +181,22 @@ class AndroidSpeechRecognizerTranscriber(private val context: Context) : VoiceTr
     }
 
     private fun handleError(error: Int) {
+        Log.d(TAG, "onError: ${errorName(error)} ($error)")
         when (error) {
             SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> {
                 // Ordinary silence/ambient noise with nothing recognizable
                 // -- not a real error, just keep listening quietly, same as
                 // AssemblyAiBatchTranscriber's VAD loop finding no speech.
+                // NOTE: on a device where the on-device model for [language]
+                // was never downloaded (Settings > System > Languages > On-
+                // device speech recognition), some OEM implementations
+                // report THIS error repeatedly instead of
+                // ERROR_LANGUAGE_NOT_SUPPORTED/ERROR_LANGUAGE_UNAVAILABLE --
+                // i.e. it silently never recognizes anything rather than
+                // failing loudly. If onBeginningOfSpeech never logs despite
+                // the user visibly talking, or this fires on every single
+                // attempt with nothing ever recognized, that's the likely
+                // cause -- not a bug in this class.
                 mainHandler.post { restartListening() }
             }
             SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> {
@@ -198,6 +217,21 @@ class AndroidSpeechRecognizerTranscriber(private val context: Context) : VoiceTr
                 onEvent?.invoke(BatchTranscriptEvent.Error(genericErrorMessage(language, error), fatal = true))
             }
         }
+    }
+
+    private fun errorName(error: Int): String = when (error) {
+        SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> "ERROR_NETWORK_TIMEOUT"
+        SpeechRecognizer.ERROR_NETWORK -> "ERROR_NETWORK"
+        SpeechRecognizer.ERROR_AUDIO -> "ERROR_AUDIO"
+        SpeechRecognizer.ERROR_SERVER -> "ERROR_SERVER"
+        SpeechRecognizer.ERROR_CLIENT -> "ERROR_CLIENT"
+        SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "ERROR_SPEECH_TIMEOUT"
+        SpeechRecognizer.ERROR_NO_MATCH -> "ERROR_NO_MATCH"
+        SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> "ERROR_RECOGNIZER_BUSY"
+        SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "ERROR_INSUFFICIENT_PERMISSIONS"
+        SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED -> "ERROR_LANGUAGE_NOT_SUPPORTED"
+        SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE -> "ERROR_LANGUAGE_UNAVAILABLE"
+        else -> "UNKNOWN"
     }
 
     private fun unsupportedMessage(language: AnnouncementLanguage): String = when (language) {

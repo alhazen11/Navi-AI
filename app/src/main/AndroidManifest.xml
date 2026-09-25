@@ -8,10 +8,21 @@
 
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Pro Mode (voiceagent/VoiceAgentClient.kt) switches AudioManager into
+         MODE_IN_COMMUNICATION for its full-duplex mic+speaker session, the
+         standard way to enable the OS's echo cancellation for a VoIP-style
+         audio path. A normal-protection permission (no runtime prompt). -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <!-- Only used for the voice command feature's AssemblyAI STT API calls
          (see audio/AssemblyAiBatchTranscriber.kt). Core detection, tracking,
          distance estimation, and risk assessment remain fully offline. -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Normal-protection permission (no runtime prompt): lets
+         core/common/NetworkMonitor.kt check for a real internet connection,
+         so voice commands can fall back to the on-device recognizer
+         automatically when there's no connectivity, not just when Offline
+         Mode is manually turned on (see audio/VoiceCommandManager.kt). -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
     <!-- Route recording/navigation (see location/, routenav/). -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />

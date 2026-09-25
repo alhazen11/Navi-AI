@@ -172,7 +172,23 @@ fun SettingsScreen(
                 )
             }
             item {
-                SwitchSetting("Offline mode", settings.offlineModeEnabled, onCheckedChange = viewModel::setOfflineModeEnabled)
+                SwitchSetting(
+                    "Offline mode",
+                    checked = state.effectiveOfflineModeEnabled,
+                    enabled = !state.offlineModeForcedByNoInternet,
+                    onCheckedChange = viewModel::setOfflineModeEnabled
+                )
+            }
+            if (state.offlineModeForcedByNoInternet) {
+                item {
+                    Text(
+                        "Active automatically — no internet connection right now. Your own Offline Mode " +
+                            "preference is unchanged and will show again once connectivity returns.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(bottom = 8.dp)
+                    )
+                }
             }
             item { OfflineUnsupportedFeaturesList() }
 
