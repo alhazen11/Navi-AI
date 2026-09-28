@@ -294,3 +294,6 @@ These never touch the network, on or off:
 - **`LocalEndpoint.isLocal()` is a literal-host check, not a live reachability check.** It doesn't verify the endpoint actually responds, only that its host looks local -- a wrong or unreachable local IP still "passes" and then fails at request time with the normal connection-error message, same as it would with Offline mode off.
 - **No airplane-mode/connectivity auto-detection.** This is a manual switch the user turns on/off, not something that reacts automatically to the device losing signal -- turning it on is a deliberate "don't even try the network" choice, not a network-state indicator.
 - **Hazard Awareness's LLM supplement is silent either way** (see section 9): its fast on-device announcement path is unaffected by this setting; only the extra LLM-described warning is skipped when blocked, with no spoken message about it (consistent with how it already handles a missing LLM config).
+
+### Release android apps
+https://drive.google.com/file/d/1nj7saIl7RJdRInwoNOCRZ62EU4y3zQPr/view?usp=sharing
