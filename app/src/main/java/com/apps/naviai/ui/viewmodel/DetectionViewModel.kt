@@ -41,11 +41,14 @@ import com.apps.naviai.domain.model.AppSettings
 import com.apps.naviai.domain.model.CameraParameters
 import com.apps.naviai.llm.LlmClient
 import com.apps.naviai.memory.MemoryManager
+import com.apps.naviai.navigation.GoHomeCommandMatcher
+import com.apps.naviai.navigation.GoHomeSignal
 import com.apps.naviai.recording.RouteRecorder
 import com.apps.naviai.recording.RouteRecordingMatcher
 import com.apps.naviai.recording.RouteRenameMatcher
 import com.apps.naviai.routenav.NavigationAnnouncements
 import com.apps.naviai.routenav.NavigationCommandMatcher
+import com.apps.naviai.routenav.RouteNavigationService
 import com.apps.naviai.scene.DetectedObjectSummary
 import com.apps.naviai.scene.HazardPromptBuilder
 import com.apps.naviai.scene.HazardTrigger
@@ -149,6 +152,7 @@ class DetectionViewModel @Inject constructor(
     private val routeRecorder: RouteRecorder,
     private val routeRepository: RouteRepository,
     private val memoryManager: MemoryManager,
+    private val goHomeSignal: GoHomeSignal,
     @InferenceDispatcher private val inferenceDispatcher: CoroutineDispatcher,
     @IoDispatcher private val ioDispatcher: CoroutineDispatcher
 ) : ViewModel() {
@@ -297,8 +301,16 @@ class DetectionViewModel @Inject constructor(
      *    matchers, low collision risk.
      * 5. Object Search -- broadest matcher (any "di mana X"/"cari X"/
      *    "ada X" question), checked last as the catch-all.
+     *
+     * [GoHomeCommandMatcher] is checked FIRST, ahead of even that order -- a global reset takes
+     * priority over every other interpretation of the command.
      */
     private suspend fun handleVoiceCommand(command: String) {
+        if (GoHomeCommandMatcher.isMatch(command)) {
+            goHome()
+            return
+        }
+
         if (ProModeCommandMatcher.isEnter(command)) {
             _navigationEvents.tryEmit(DetectionNavigationEvent.GoToProMode)
             return
@@ -351,11 +363,29 @@ class DetectionViewModel @Inject constructor(
             return
         }
 
+        val objectQuery = ObjectSearchMatcher.extractQuery(command)
         when {
             SceneDescriptionMatcher.matches(command) -> describeSurroundings(command)
             TextReadingMatcher.matches(command) -> readTextAloud(command)
-            else -> ObjectSearchMatcher.extractQuery(command)?.let { searchForObject(it) }
+            objectQuery != null -> searchForObject(objectQuery)
+            // Every other matcher above (Memory, Route Recording/Navigation/rename, Scene/Text/Object
+            // Search) already returned early on its own match -- reaching here means the wake word
+            // was heard but nothing recognized the actual command, which used to just go silent. A
+            // blind/low-vision user has no on-screen text to fall back on to tell "NAVI heard me but
+            // didn't understand" apart from "NAVI never heard me at all" -- this makes that
+            // distinction audible instead of leaving both look identical (silence).
+            else -> unrecognizedCommand(command)
         }
+    }
+
+    private fun unrecognizedCommand(command: String) {
+        Log.i(TAG, "Unrecognized command: \"$command\"")
+        ttsManager.speak(unrecognizedCommandMessage(currentSettings.speechLanguage), flushQueue = false, utteranceId = "unrecognized_command")
+    }
+
+    private fun unrecognizedCommandMessage(language: AnnouncementLanguage): String = when (language) {
+        AnnouncementLanguage.INDONESIAN -> "Maaf, saya tidak mengerti perintah itu."
+        AnnouncementLanguage.ENGLISH -> "Sorry, I didn't understand that command."
     }
 
     /**
@@ -378,6 +408,31 @@ class DetectionViewModel @Inject constructor(
 
     private fun hasLocationPermission(): Boolean =
         ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+
+    /**
+     * "NAVI, kembali" / "kembali ke home" -- see [GoHomeCommandMatcher] and [GoHomeSignal]'s docs.
+     * Stops whatever this instance can see running (route recording, GPS navigation) even though
+     * this screen IS home, since both [RouteRecorder] and [RouteNavigationService] are app-wide
+     * singletons that keep running in the background while the user is looking at Detection --
+     * e.g. navigation started elsewhere, then the user pressed the system back button instead of
+     * saying "stop navigasi". [RecordingViewModel]/[com.apps.naviai.routenav.NavigationController]
+     * make the same two calls from their own collectors when they hear this while their own screen
+     * is what's showing -- both calls are idempotent (a no-op when nothing is running), so hearing
+     * this from more than one still-alive collector at once (this screen's own ViewModel included,
+     * since Detection's back-stack entry -- and therefore this instance -- stays alive underneath
+     * every other screen) is harmless, not a double-stop bug.
+     */
+    private fun goHome() {
+        if (routeRecorder.isRecording) routeRecorder.stop()
+        RouteNavigationService.stop(context, spokenConfirmation = false)
+        ttsManager.speak(goingHomeMessage(currentSettings.speechLanguage), flushQueue = true, utteranceId = "go_home")
+        goHomeSignal.trigger()
+    }
+
+    private fun goingHomeMessage(language: AnnouncementLanguage): String = when (language) {
+        AnnouncementLanguage.INDONESIAN -> "Kembali ke beranda."
+        AnnouncementLanguage.ENGLISH -> "Returning to Home."
+    }
 
     /**
      * "Ganti nama rute X menjadi Y" / "rename route X to Y": looks [oldName]
@@ -598,7 +653,9 @@ class DetectionViewModel @Inject constructor(
             val lastWarnedAt = hazardWarnedTrackIds[tracked.trackingId] ?: 0L
             if (nowMs - lastWarnedAt < HAZARD_COOLDOWN_MS) return@firstOrNull false
             val box = tracked.detection.boundingBox
-            HazardTrigger.isBlockingHazard(box.width(), box.height(), box.centerX(), frameWidth, frameHeight, tracked.riskLevel)
+            HazardTrigger.isBlockingHazard(
+                tracked.detection.label, box.width(), box.height(), box.centerX(), frameWidth, frameHeight, tracked.riskLevel
+            )
         } ?: return
 
         hazardWarnedTrackIds[candidate.trackingId] = nowMs
@@ -761,7 +818,12 @@ class DetectionViewModel @Inject constructor(
 
         val withRisk = tracked.map { it.copy(riskLevel = riskAssessmentEngine.assess(it, uprightWidth)) }
 
-        if (currentSettings.enableVoiceAssistance && currentSettings.enableTracking) {
+        // Never talk over a command the user is already saying (see VoiceCommandManager.userSpeaking).
+        // Deliberately skips evaluate() entirely rather than passing speak = false: that would still
+        // advance each track's cooldown, turning "wait for them to finish" into "drop this warning
+        // for a whole cooldown". Skipping leaves the cooldowns untouched, so anything due is spoken
+        // the moment they stop.
+        if (currentSettings.enableVoiceAssistance && currentSettings.enableTracking && !voiceCommandManager.userSpeaking.value) {
             // "Effectively offline" (Offline Mode ON, OR genuinely no internet right now -- see
             // NetworkMonitor/offlineModeBlocksLlm) always speaks here, full stop -- even if a
             // local/LAN LLM happens to be configured and reachable either way, so checkForHazard

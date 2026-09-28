@@ -95,6 +95,12 @@ object ProModeTools {
             )
             put(deleteRouteTool(idOrEn))
             put(tool("list_all_memories", if (idOrEn) "Menyebutkan semua informasi yang pernah diminta pengguna untuk diingat." else "List everything the user has previously asked to be remembered."))
+            put(
+                tool(
+                    "exit_pro_mode",
+                    if (idOrEn) "Keluar dari Mode Pro dan kembali ke layar utama aplikasi. Panggil ini saat pengguna bilang sudah selesai, ingin berhenti mengobrol, atau minta keluar dari Mode Pro -- dengan kata apa pun, mis. \"sudah cukup\", \"selesai dulu\", \"segitu aja\", \"keluar\", \"matikan mode pro\". Ucapkan salam perpisahan singkat sebelum memanggil ini." else "Exit Pro Mode and return to the app's main screen. Call this when the user indicates they're done, want to stop the conversation, or ask to leave Pro Mode -- however they phrase it, e.g. \"that's all\", \"I'm done\", \"that's enough for now\", \"exit\", \"turn off pro mode\". Say a brief goodbye before calling this."
+                )
+            )
         }
     }
 

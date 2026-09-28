@@ -172,18 +172,26 @@ fun SettingsScreen(
                 )
             }
             item {
+                // Stays interactive even while connectivity is forcing it on: the switch reports the
+                // EFFECTIVE state, but the saved preference underneath is still the user's to set,
+                // and it's what takes over the moment the network is back. The caption below is what
+                // makes that visible, since the switch itself can't move while it's forced.
                 SwitchSetting(
                     "Offline mode",
                     checked = state.effectiveOfflineModeEnabled,
-                    enabled = !state.offlineModeForcedByNoInternet,
                     onCheckedChange = viewModel::setOfflineModeEnabled
                 )
             }
             if (state.offlineModeForcedByNoInternet) {
                 item {
                     Text(
-                        "Active automatically — no internet connection right now. Your own Offline Mode " +
-                            "preference is unchanged and will show again once connectivity returns.",
+                        if (state.settings.offlineModeEnabled) {
+                            "Active automatically — no internet connection right now. Your own setting is " +
+                                "on too, so it stays on once connectivity returns."
+                        } else {
+                            "Active automatically — no internet connection right now. Your own setting is " +
+                                "off, so it turns back off once connectivity returns. Tap to change it."
+                        },
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.primary,
                         modifier = Modifier.padding(bottom = 8.dp)

@@ -19,18 +19,27 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Apps
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.FiberManualRecord
+import androidx.compose.material.icons.filled.Map
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.MicOff
+import androidx.compose.material.icons.filled.Navigation
+import androidx.compose.material.icons.filled.Psychology
+import androidx.compose.material.icons.filled.RemoveRedEye
+import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.TextFields
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
@@ -58,7 +67,9 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.apps.naviai.camera.CameraManager
 import com.apps.naviai.core.permissions.rememberCameraPermissionState
 import com.apps.naviai.core.permissions.rememberMicrophonePermissionState
+import com.apps.naviai.ui.viewmodel.FeatureStatus
 import com.apps.naviai.ui.viewmodel.ProModeConnectionStatus
+import com.apps.naviai.ui.viewmodel.ProModeFeature
 import com.apps.naviai.ui.viewmodel.ProModeViewModel
 import com.apps.naviai.ui.viewmodel.TranscriptEntry
 import com.apps.naviai.ui.viewmodel.TranscriptSpeaker
@@ -75,15 +86,25 @@ import java.util.concurrent.Executors
  * No detection overlay/bounding boxes here (unlike [DetectionScreen]) --
  * this screen deliberately doesn't run the object-detection pipeline; the
  * camera preview only feeds the vision-backed tools a current frame.
+ *
+ * Every feature, including route recording/navigation, stays fully conversational here -- calling
+ * a tool never navigates away to that feature's own screen (e.g. [com.apps.naviai.ui.screens.RecordingScreen],
+ * [com.apps.naviai.ui.screens.NavigationScreen]). [FeaturesPanel] is the only in-Pro-Mode surface for
+ * "what's running"; leaving this screen only ever happens via [onBack] or a voice-triggered exit
+ * (see [ProModeViewModel]'s class doc).
  */
 @Composable
-fun ProModeScreen(onBack: () -> Unit, viewModel: ProModeViewModel = hiltViewModel()) {
+fun ProModeScreen(
+    onBack: () -> Unit,
+    viewModel: ProModeViewModel = hiltViewModel()
+) {
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val cameraPermission = rememberCameraPermissionState()
     val micPermission = rememberMicrophonePermissionState()
     var showDebugLog by remember { mutableStateOf(false) }
+    var showFeatures by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         if (!micPermission.isGranted) micPermission.request()
@@ -146,38 +167,55 @@ fun ProModeScreen(onBack: () -> Unit, viewModel: ProModeViewModel = hiltViewMode
                 Spacer(Modifier.size(8.dp))
                 Text("Pro Mode", color = Color.White, style = MaterialTheme.typography.titleMedium)
             }
-            // Raw protocol trace, in-app -- see ProModeUiState.debugLog's doc for why this exists instead
-            // of asking for `adb logcat` output: this protocol has never been verified against a live
-            // session, and being able to copy the actual exchange is the only way to debug it for real.
-            IconButton(
-                onClick = { showDebugLog = !showDebugLog },
-                modifier = Modifier.semantics { contentDescription = if (showDebugLog) "Hide debug log" else "Show debug log" }
-            ) {
-                Icon(Icons.Filled.BugReport, contentDescription = null, tint = Color.White)
+            Row {
+                // What NAVI can do here and what it's doing right now -- Pro Mode's equivalent of
+                // DetectionScreen's always-visible feature icon row + status cards, collapsed behind a
+                // toggle since Pro Mode's camera preview/transcript already compete for the same space.
+                IconButton(
+                    onClick = { showFeatures = !showFeatures; if (showFeatures) showDebugLog = false },
+                    modifier = Modifier.semantics { contentDescription = if (showFeatures) "Hide features panel" else "Show features panel" }
+                ) {
+                    Icon(Icons.Filled.Apps, contentDescription = null, tint = Color.White)
+                }
+                // Raw protocol trace, in-app -- see ProModeUiState.debugLog's doc for why this exists instead
+                // of asking for `adb logcat` output: this protocol has never been verified against a live
+                // session, and being able to copy the actual exchange is the only way to debug it for real.
+                IconButton(
+                    onClick = { showDebugLog = !showDebugLog; if (showDebugLog) showFeatures = false },
+                    modifier = Modifier.semantics { contentDescription = if (showDebugLog) "Hide debug log" else "Show debug log" }
+                ) {
+                    Icon(Icons.Filled.BugReport, contentDescription = null, tint = Color.White)
+                }
             }
         }
 
-        if (showDebugLog) {
-            DebugLogPanel(
+        when {
+            showDebugLog -> DebugLogPanel(
                 lines = uiState.debugLog,
                 modifier = Modifier.align(Alignment.Center).fillMaxWidth().padding(16.dp)
             )
-        } else {
-            VoiceAgentPanel(
-                status = uiState.status,
-                activeToolLabel = uiState.activeToolLabel,
-                isProcessing = uiState.isProcessing,
-                isMicMuted = uiState.isMicMuted,
-                modifier = Modifier.align(Alignment.Center).padding(24.dp)
+            showFeatures -> FeaturesPanel(
+                statuses = uiState.featureStatuses,
+                activeFeature = activeFeatureFor(uiState.activeToolLabel),
+                modifier = Modifier.align(Alignment.Center).fillMaxWidth().padding(16.dp)
             )
+            else -> {
+                VoiceAgentPanel(
+                    status = uiState.status,
+                    activeToolLabel = uiState.activeToolLabel,
+                    isProcessing = uiState.isProcessing,
+                    isMicMuted = uiState.isMicMuted,
+                    modifier = Modifier.align(Alignment.Center).padding(24.dp)
+                )
 
-            TranscriptLog(
-                entries = uiState.transcript,
-                modifier = Modifier
-                    .align(Alignment.BottomCenter)
-                    .fillMaxWidth()
-                    .padding(16.dp)
-            )
+                TranscriptLog(
+                    entries = uiState.transcript,
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .padding(16.dp)
+                )
+            }
         }
     }
 }
@@ -206,7 +244,7 @@ private fun DebugLogPanel(lines: List<String>, modifier: Modifier = Modifier) {
             .padding(16.dp)
     ) {
         Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
-            Text("Debug log (${lines.size})", style = MaterialTheme.typography.titleSmall)
+            Text("Debug log (${lines.size})", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             Button(
                 onClick = { copyDebugLog(clipboard, lines) },
                 enabled = lines.isNotEmpty(),
@@ -236,6 +274,116 @@ private fun DebugLogPanel(lines: List<String>, modifier: Modifier = Modifier) {
 
 private fun copyDebugLog(clipboard: ClipboardManager, lines: List<String>) {
     clipboard.setText(AnnotatedString(lines.joinToString("\n")))
+}
+
+/**
+ * Maps [com.apps.naviai.ui.viewmodel.ProModeUiState.activeToolLabel] -- the raw tool name off
+ * [com.apps.naviai.voiceagent.VoiceAgentEvent.ToolInvoked], e.g. `"start_navigation"` -- to the
+ * [ProModeFeature] it belongs to, so [FeaturesPanel] can highlight the right row while a call is
+ * in flight. Kept here rather than as a shared lookup: this is a UI-only concern (which row lights
+ * up), the tool-name strings themselves are owned by [com.apps.naviai.voiceagent.ProModeTools].
+ */
+private fun activeFeatureFor(toolName: String?): ProModeFeature? = when (toolName) {
+    "describe_surroundings" -> ProModeFeature.SCENE_UNDERSTANDING
+    "read_text" -> ProModeFeature.TEXT_READING
+    "search_object" -> ProModeFeature.OBJECT_SEARCH
+    "save_memory", "recall_memory", "forget_memory", "clear_all_memories", "list_all_memories" -> ProModeFeature.MEMORY
+    "start_route_recording", "stop_route_recording" -> ProModeFeature.ROUTE_RECORDING
+    "start_navigation", "stop_navigation" -> ProModeFeature.NAVIGATION
+    "list_saved_routes", "rename_route", "delete_route" -> ProModeFeature.ROUTE_MANAGEMENT
+    else -> null
+}
+
+private fun ProModeFeature.icon(): ImageVector = when (this) {
+    ProModeFeature.SCENE_UNDERSTANDING -> Icons.Filled.RemoveRedEye
+    ProModeFeature.TEXT_READING -> Icons.Filled.TextFields
+    ProModeFeature.OBJECT_SEARCH -> Icons.Filled.Search
+    ProModeFeature.MEMORY -> Icons.Filled.Psychology
+    ProModeFeature.ROUTE_RECORDING -> Icons.Filled.FiberManualRecord
+    ProModeFeature.NAVIGATION -> Icons.Filled.Navigation
+    ProModeFeature.ROUTE_MANAGEMENT -> Icons.Filled.Map
+    else -> Icons.Filled.Map
+}
+
+/**
+ * "What NAVI can do here, and what it's doing right now" -- Pro Mode's answer to
+ * [DetectionScreen]'s always-visible feature icons + per-feature status cards, collapsed into one
+ * togglable panel (see the top-bar [Icons.Filled.Apps] button) since every one of these is reached
+ * by voice here rather than its own button. A row lights up while its tool is running
+ * ([activeFeature]), and keeps its last outcome after ([statuses]) -- a feature never in
+ * [statuses] simply hasn't been used yet this session. Every feature, including route recording and
+ * navigation, is answered right here -- none of them navigate away to their own screen.
+ */
+@Composable
+private fun FeaturesPanel(
+    statuses: Map<ProModeFeature, FeatureStatus>,
+    activeFeature: ProModeFeature?,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier
+            .heightIn(max = 480.dp)
+            .clip(RoundedCornerShape(20.dp))
+            .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.96f))
+            .padding(16.dp)
+    ) {
+        Text("Features", style = MaterialTheme.typography.titleSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Spacer(Modifier.size(4.dp))
+        Text(
+            "Say \"NAVI, ...\" to use any of these -- this panel just shows what's running.",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Spacer(Modifier.size(12.dp))
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            items(ProModeFeature.entries) { feature ->
+                FeatureRow(feature = feature, status = statuses[feature], isActive = feature == activeFeature)
+            }
+        }
+    }
+}
+
+@Composable
+private fun FeatureRow(feature: ProModeFeature, status: FeatureStatus?, isActive: Boolean, modifier: Modifier = Modifier) {
+    val (stateText, stateColor) = when {
+        isActive || status is FeatureStatus.Running -> "Running…" to MaterialTheme.colorScheme.primary
+        status is FeatureStatus.Success -> status.message to MaterialTheme.colorScheme.primary
+        status is FeatureStatus.Failed -> status.message to MaterialTheme.colorScheme.error
+        else -> "Idle" to MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    val rowDescription = "${feature.label}: $stateText"
+
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(14.dp))
+            .background(if (isActive) MaterialTheme.colorScheme.primary.copy(alpha = 0.12f) else Color.Transparent)
+            .padding(horizontal = 8.dp, vertical = 10.dp)
+            .semantics { contentDescription = rowDescription },
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(contentAlignment = Alignment.Center, modifier = Modifier.size(28.dp)) {
+            if (isActive || status is FeatureStatus.Running) {
+                CircularProgressIndicator(modifier = Modifier.size(24.dp), strokeWidth = 2.dp)
+            } else {
+                Icon(
+                    feature.icon(),
+                    contentDescription = null,
+                    tint = if (status is FeatureStatus.Failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+        Spacer(Modifier.size(12.dp))
+        Column {
+            Text(feature.label, style = MaterialTheme.typography.bodyMedium, color = stateColor,)
+            Text(
+                stateText,
+                style = MaterialTheme.typography.bodySmall,
+                color = stateColor,
+                maxLines = 2
+            )
+        }
+    }
 }
 
 /**

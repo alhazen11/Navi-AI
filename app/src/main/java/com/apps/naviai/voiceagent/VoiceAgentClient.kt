@@ -3,10 +3,8 @@ package com.apps.naviai.voiceagent
 import android.annotation.SuppressLint
 import android.content.ContentValues
 import android.content.Context
-import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioRecord
-import android.media.AudioTrack
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
 import android.os.Build
@@ -32,7 +30,6 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.RandomAccessFile
-import java.net.URLEncoder
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import javax.inject.Inject
@@ -45,35 +42,43 @@ import javax.inject.Inject
  * the agent's own LLM handling turn detection and tool calling -- no
  * wake-word gating, no local VAD, no regex command matchers.
  *
- * **The agent's own synthesized voice (`reply.audio`) is played directly**
- * through an internal [AudioTrack] (see [handleReplyAudio]/[ensureAudioTrack]) --
- * base64 PCM16 24kHz mono chunks decoded and streamed as they arrive.
- * [com.apps.naviai.ui.viewmodel.ProModeViewModel] no longer speaks replies
- * through [com.apps.naviai.audio.TextToSpeechManager]; it only shows
- * `transcript.agent`'s text in the on-screen transcript and reacts to
- * [VoiceAgentEvent.AgentAudioStarted]/[VoiceAgentEvent.AgentAudioStopped]
- * for mic-muting/UI state. An earlier version of this class deliberately
- * discarded `reply.audio` and used the app's own TTS instead, to sidestep
- * `ProModeViewModel`'s documented uncertainty around whether AssemblyAI's
- * own voice output covers Indonesian well -- that tradeoff was reversed on
- * explicit request to use AssemblyAI's full speech-to-speech pipeline
- * end-to-end; if Indonesian voice quality turns out to be poor in practice,
- * that's the thing to revisit.
+ * **Agent voice: this class does NOT play the agent's own audio.** `reply.audio` is received and
+ * dropped; [com.apps.naviai.ui.viewmodel.ProModeViewModel] speaks `transcript.agent`'s text through the
+ * app's own [com.apps.naviai.audio.TextToSpeechManager] instead. This went back and forth twice, so the
+ * reasoning is worth keeping: an intermediate version decoded `reply.audio` into an internal `AudioTrack`
+ * to use AssemblyAI's full speech-to-speech pipeline end-to-end. Tested on a real device, that path
+ * *looked* healthy in the logs (chunks arriving, decoding, `AudioTrack.play()`/`write()` all succeeding,
+ * no errors) yet produced no audible sound at all -- most likely `USAGE_ASSISTANT` routing, though it was
+ * not worth chasing further, because the same live session showed the deciding constraint: the agent
+ * replies in English. Its synthesized voice only covers the six languages listed in
+ * [VoiceAgentLanguages], and this app's users speak Indonesian. The app's own TTS is the only output path
+ * that can actually say an Indonesian sentence, and it already carries the user's configured language,
+ * speech rate and pitch, so it is what Pro Mode uses. Consequences for the caller: it owns the whole
+ * "NAVI is speaking" window (mic muting, barge-in, UI state) off its own TTS progress, since no playback
+ * event can come from here.
  *
- * **Wire protocol** (verified against AssemblyAI's Voice Agent API docs and
- * blog posts as of this writing -- this is a new API and the protocol may
- * evolve, so treat this as a snapshot, not a permanent contract):
- * - Connect: `wss://agents.assemblyai.com/v1/ws?token=<key>` -- auth via query param, per AssemblyAI
- *   support's own reference client for this exact issue (a session sent via an `Authorization: Bearer`
- *   header instead still connected and the greeting still worked, but `input.speech.started` never once
- *   fired even with confirmed non-silent, deliberately loud microphone input -- switched to match
- *   support's example exactly rather than keep guessing at header-vs-query-param on our own). An earlier
- *   version also added `&sample_rate=...&encoding=...` here based on a DIFFERENT AssemblyAI product's
- *   convention; that was wrong for this endpoint (audio format belongs in `input.format.encoding` below,
- *   not the URL) and has been removed.
+ * **Wire protocol** (re-verified 2026-09-27 against AssemblyAI's currently-published Voice Agent API
+ * docs -- specifically the WebSocket Events Reference and the Create Agent API spec pages, not just
+ * blog posts -- after the extensive live-session investigation below found real bugs this way; this is
+ * a new API and the protocol may still evolve, so treat this as a snapshot, not a permanent contract):
+ * - Connect: `wss://agents.assemblyai.com/v1/ws` with an `Authorization: Bearer <key>` header. An earlier
+ *   version of this class used `?token=<key>` instead, on advice attributed to AssemblyAI support for the
+ *   `input.speech.started`-never-fires issue investigated at length below -- but that investigation's own
+ *   notes say the header form was tried too and showed the *identical* symptom, so the auth method was
+ *   never actually the differentiator; switched back to the header form since it's what BOTH of AssemblyAI's
+ *   own current docs pages document (the query-param form appears in neither).
  * - First client message: `{"type":"session.update","session":{"system_prompt":...,"greeting":...,"tools":[...],
- *   "input":{"format":{"encoding":"audio/pcm"},"language_codes":[...],"turn_detection":{...}}}}` -- see
- *   [buildInlineSessionUpdate] for the exact shape and why `input.format.encoding` matters.
+ *   "input":{"format":{"encoding":"audio/pcm","sample_rate":24000},"language_codes":[...],"turn_detection":{...}},
+ *   "output":{"format":{"encoding":"audio/pcm","sample_rate":24000}}}}` -- see [buildInlineSessionUpdate] for the
+ *   exact shape. Two concrete mismatches against the docs were found and fixed here: `turn_detection` was
+ *   sending `min_silence`/`max_silence`/`interrupt_response`/`interruption_delay`, none of which are documented
+ *   fields (the Events Reference lists only `vad_threshold`, `silence_duration_ms`, `speech_duration_ms`) --
+ *   the server likely silently ignored the unrecognized ones rather than erroring, so `turn_detection` was
+ *   effectively running on partial defaults this whole time; and `voice_focus: null` was sent even though the
+ *   Create Agent spec explicitly does not list `voice_focus` as an `input` field at all -- removed rather than
+ *   guessed at. Neither of these two fixes is confirmed to be *the* fix for the "audio never reaches the
+ *   server" finding below (they're independently wrong regardless of that bug); no live API key/device was
+ *   available in this environment either, so they're unverified against a real session, same caveat as before.
  * - Server confirms with `{"type":"session.ready",...}` -- only then does this class start capturing/sending audio.
  * - Audio in: `{"type":"input.audio","audio":"<base64 PCM16 mono 24kHz>"}`, sent continuously in small chunks
  *   (see [setMicMuted] for the one case sending is paused without tearing down capture).
@@ -83,6 +88,9 @@ import javax.inject.Inject
  * - Transcripts: `{"type":"transcript.user","text":...}` / `{"type":"transcript.agent","text":...,"interrupted":...}`
  *   are finalized-only (partial/delta variants exist but aren't surfaced -- Pro Mode's transcript log only needs
  *   the final text of each turn).
+ * - Agent audio out: `{"type":"reply.audio","data":"<base64 PCM16 mono 24kHz>"}` -- received and ignored (see
+ *   "Agent voice" above). Worth recording since it cost time: the payload key is `data`, not `audio`, and the
+ *   version of this class that did play it read `"audio"` exclusively, so it silently decoded nothing at all.
  * - End: this class sends `{"type":"session.end"}` and closes; the server may also end the session itself
  *   (`{"type":"session.ended"}`) or report a protocol error (`{"type":"session.error",...}`).
  * - Resume: `session.ready` carries a `session_id`, saved here. If the WebSocket drops for any reason
@@ -94,39 +102,28 @@ import javax.inject.Inject
  *   end the whole Pro Mode session -- "sometimes it just stops responding" -- with no way back short of
  *   leaving and re-entering Pro Mode.
  *
- * **Real barge-in / self-listening**: replies are now played through
- * [audioTrack] (see above) while this class's mic capture stays
- * continuously on -- deliberately NOT muted during that playback, unlike an
- * earlier version. Muting during every reply would make interruption
- * impossible (the user would have to wait out the whole reply before the
- * mic listened again, regardless of when they actually wanted to speak);
- * instead, [isEchoCancellationAvailable] exposes whether the device
- * supports [AcousticEchoCanceler] -- attached to the capture session in
- * [startAudioCapture] when it does, so the mic doesn't feed NAVI's own
- * voice back to the server as if it were the user talking.
- * [com.apps.naviai.ui.viewmodel.ProModeViewModel] checks this before
- * connecting: on a device that reports it, a real `input.speech.started`
- * while NAVI is speaking is now handled entirely inside this class --
- * [stopAgentAudioPlayback] flushes [audioTrack] immediately (see
- * `"input.speech.started"`'s handling), so playback actually stops rather
- * than just being talked over; on a device without AEC,
- * [com.apps.naviai.ui.viewmodel.ProModeViewModel] falls back to
- * [setMicMuted] around [VoiceAgentEvent.AgentAudioStarted]/
- * [VoiceAgentEvent.AgentAudioStopped] instead, trading barge-in away for
- * avoiding a self-listening loop AEC would otherwise have prevented.
- * [AcousticEchoCanceler] is a best-effort platform feature, not a guarantee
- * -- quality still varies by device even where it reports available.
+ * **Self-listening: the mic is unconditionally muted while NAVI's own TTS is speaking.**
+ * [com.apps.naviai.ui.viewmodel.ProModeViewModel] used to gate this on [AcousticEchoCanceler]
+ * availability -- leaving the mic open for "real" barge-in on a device that reported AEC support,
+ * since [setMicMuted] muting through every reply would otherwise make interruption impossible. That
+ * was confirmed WRONG on a real device once the agent's voice moved from an internal `AudioTrack` (the
+ * same low-level pipeline the AEC was attached alongside) to [com.apps.naviai.audio.TextToSpeechManager]
+ * -- see this class's "Agent voice" doc for why that move happened. Android's system TTS engine is a
+ * separate audio session the platform AEC effect has no guaranteed reference to, and on that device it
+ * measurably wasn't cancelling it: the agent audibly reacted to its own spoken replies, a self-response
+ * loop. [setMicMuted] now runs unconditionally for exactly the window [TextToSpeechManager.isSpeaking]
+ * reports (see [com.apps.naviai.ui.viewmodel.ProModeViewModel]'s init block) -- true mid-sentence
+ * interruption is gone, but the user can still cut NAVI off right as a reply ends.
+ * [AcousticEchoCanceler] is still attached in [startAudioCapture] where the device supports it (harmless,
+ * possibly still marginally useful for other noise), but nothing here depends on it working any more.
  * This class deliberately does NOT set `AudioManager.MODE_IN_COMMUNICATION`
  * or use [MediaRecorder.AudioSource.VOICE_COMMUNICATION] for capture -- an
  * earlier version did, on the theory that it would help suppress echo, but
  * that mode changes system-wide audio routing/focus and can silently
- * reroute or duck OTHER apps' audio output (including this app's own
- * [com.apps.naviai.audio.TextToSpeechManager] calls) toward the earpiece/
- * call audio path instead of the normal speaker -- a real, concrete way to
- * end up with "no sound at all" from NAVI's replies while everything else
- * (transcripts, connection) still works. [AcousticEchoCanceler] (a per-session
- * audio effect) achieves the same echo-suppression goal without touching
- * global audio routing the way that mode did.
+ * reroute or duck OTHER apps' audio output (including [com.apps.naviai.audio.TextToSpeechManager]'s
+ * own) toward the earpiece/call audio path instead of the normal speaker -- a real, concrete way to
+ * end up with "no sound at all" from NAVI's replies while everything else (transcripts, connection)
+ * still works.
  *
  * Not a `@Singleton` -- a fresh instance is created per
  * [com.apps.naviai.ui.viewmodel.ProModeViewModel], living only as long as
@@ -155,6 +152,22 @@ import javax.inject.Inject
  *   back and confirmed by a human listener to contain real, audible speech
  *   -- not silence, not noise, not corrupted/misaligned samples.
  *
+ * **ROOT CAUSE FOUND (2026-09-27): an unsupported `input.language_codes` value.** Everything below this
+ * paragraph is the investigation that preceded it, kept because it's what ruled the audio pipeline out so
+ * thoroughly. Pro Mode was sending `language_codes: ["id", "en"]` -- Indonesian first -- because this app's
+ * users speak Indonesian and AssemblyAI's *speech-to-text product* supports it. The Voice Agent API is a
+ * separate pipeline whose own published language list covers only English/Spanish/French/German/Italian/
+ * Portuguese, and its events reference notes that `language_codes` is "applied on the next STT connect".
+ * An unsupported code there is accepted syntactically (it's just an array of strings -- hence zero
+ * `session.error`, and a `session.ready` that echoes the config back verbatim) but leaves the server with
+ * no working transcriber for the session. That single fact accounts for every symptom at once: the greeting
+ * plays (the LLM/TTS half never depends on the input language), `input.speech.started`/`transcript.user`
+ * never fire, the backend session recording's input channel is empty, and changing `turn_detection` makes
+ * no difference because no VAD is running at all. It also explains why every audio-level check below came
+ * back clean -- the audio was always fine; nothing was listening to it. See [VoiceAgentLanguages], which now
+ * filters unsupported codes out and omits the field entirely when nothing supported is left, so the server
+ * falls back to its documented automatic detection instead.
+ *
  * **CONFIRMED server-side via the session's own backend record.** Fetching
  * a completed session through AssemblyAI's backend API
  * (`GET /v1/sessions/{session_id}`) and downloading its own `audio`
@@ -167,12 +180,12 @@ import javax.inject.Inject
  * [buildInlineSessionUpdate] sent (`format`, `turn_detection`,
  * `language_codes`, etc. all echoed back correctly) -- so the session was
  * configured exactly as intended, but the audio itself never made it into
- * what the server actually stored/processed. This is airtight proof the
- * loss happens somewhere between this class's `webSocket.send()` call
- * (which reports success for every chunk) and AssemblyAI's own audio
- * ingestion/storage -- entirely outside this class's control. There is no
- * further client-side change that could fix this; the remaining action is
- * reporting this exact finding to AssemblyAI support.
+ * what the server actually stored/processed. This narrowed the loss to
+ * somewhere between this class's `webSocket.send()` call (which reports
+ * success for every chunk) and AssemblyAI's own audio ingestion -- which
+ * was read at the time as "outside this class's control", but is explained
+ * by the language-code root cause above: audio for a session with no working
+ * transcriber attached is never ingested in the first place.
  */
 class VoiceAgentClient @Inject constructor(
     private val httpClient: OkHttpClient,
@@ -187,10 +200,6 @@ class VoiceAgentClient @Inject constructor(
     private val toolHandlers = mutableMapOf<String, suspend (JSONObject) -> String>()
     @Volatile private var connected = false
     @Volatile private var micMuted = false
-
-    // ---- Agent voice playback (reply.audio -> AudioTrack) -- see handleReplyAudio()'s doc. ----
-    private var audioTrack: AudioTrack? = null
-    @Volatile private var agentAudioPlaying = false
 
     // ---- Debug WAV capture -- see startWavCapture()'s doc. ----
     private var wavFile: RandomAccessFile? = null
@@ -207,28 +216,15 @@ class VoiceAgentClient @Inject constructor(
     @Volatile private var deliberateDisconnect = false
     private var reconnectAttempts = 0
 
-    /**
-     * Whether this device can attach [AcousticEchoCanceler] to a capture
-     * session -- a static platform capability check, safe to call before
-     * [connect]. See the class doc's "Real barge-in" section: the caller
-     * should use this to decide whether it's safe to allow real interruption
-     * (mic stays open through NAVI's own speech) or should fall back to
-     * [setMicMuted] around each reply instead.
-     */
-    fun isEchoCancellationAvailable(): Boolean = AcousticEchoCanceler.isAvailable()
-
     /** Must be called before [connect]. [handler] runs off the main thread; its return value becomes the tool's `result` text, which the agent's own LLM turns into a spoken reply. */
     fun registerTool(name: String, handler: suspend (JSONObject) -> String) {
         toolHandlers[name] = handler
     }
 
     /**
-     * Stops (or resumes) forwarding captured mic audio to the server without
-     * tearing down [AudioRecord] -- the fallback self-listening guard for a
-     * device where [isEchoCancellationAvailable] is false (see the class
-     * doc's "Real barge-in" section). Calling this on a device where AEC is
-     * active is harmless but unnecessary -- the caller decides which mode
-     * it's in, this class doesn't gate on [isEchoCancellationAvailable] itself.
+     * Stops (or resumes) forwarding captured mic audio to the server without tearing down
+     * [AudioRecord] -- the self-listening guard while NAVI's own TTS is speaking, called
+     * unconditionally now (see the class doc's "Self-listening" section for why).
      */
     fun setMicMuted(muted: Boolean) {
         micMuted = muted
@@ -274,19 +270,15 @@ class VoiceAgentClient @Inject constructor(
             traceWarn("openWebSocket() called with no apiKey set -- connect() was never called successfully")
             return
         }
-        // Auth via ?token= query param, NOT an Authorization header -- per
-        // AssemblyAI support's own example code for this exact issue (an
-        // Authorization: Bearer header still let the session connect and
-        // the greeting work, but query-param auth is what their reference
-        // client actually uses; audio format is declared inside
-        // session.update's input.format instead of a query param, per the
-        // actual spec -- see buildInlineSessionUpdate).
-        val wsUrl = "$WEBSOCKET_URL?token=${URLEncoder.encode(key, "UTF-8")}"
+        // Authorization: Bearer header, per AssemblyAI's currently-published Events Reference and
+        // Create Agent API docs (both document header auth; neither documents a ?token= query param --
+        // see the class doc's "Wire protocol" section for why this was previously query-param instead).
         val request = Request.Builder()
-            .url(wsUrl)
+            .url(WEBSOCKET_URL)
+            .header("Authorization", "Bearer $key")
             .build()
 
-        trace("-> WebSocket connect attempt to $WEBSOCKET_URL (?token= query param set, ${key.length} char key)")
+        trace("-> WebSocket connect attempt to $WEBSOCKET_URL (Authorization: Bearer header set, ${key.length} char key)")
 
         webSocket = httpClient.newWebSocket(
             request,
@@ -343,12 +335,15 @@ class VoiceAgentClient @Inject constructor(
      * ```
      * {"type":"session.update","session":{
      *   "system_prompt":..., "greeting":..., "tools":[...],
-     *   "input":{"format":{"encoding":"audio/pcm"},"language_codes":[...],
-     *            "transcription_mode":"min_latency","continuous_partials":true,"voice_focus":null,
-     *            "turn_detection":{"vad_threshold":0.15,"min_silence":500,"max_silence":1500,
-     *                              "interrupt_response":true,"interruption_delay":0}}
+     *   "input":{"format":{"encoding":"audio/pcm","sample_rate":24000},"language_codes":[...],
+     *            "transcription_mode":"min_latency",
+     *            "turn_detection":{"vad_threshold":0.15,"silence_duration_ms":500}},
+     *   "output":{"format":{"encoding":"audio/pcm","sample_rate":24000}}
      * }}
      * ```
+     * `language_codes` is present only when at least one requested code is actually supported -- see
+     * [VoiceAgentLanguages], and the class doc's root-cause note, for why sending an unsupported one
+     * silently breaks the entire session's speech recognition.
      * `input.format` is a nested JSON OBJECT (`{"encoding":"audio/pcm"}`),
      * NOT a plain string -- this was briefly changed to a string based on
      * three AssemblyAI blog posts' own example payloads (two of which
@@ -372,38 +367,68 @@ class VoiceAgentClient @Inject constructor(
      * nothing here at all) produced the identical symptom -- zero
      * `input.speech.started` across 114 seconds despite RMS peaks up to
      * 15173 (unambiguously loud, real audio), zero `session.error`, zero
-     * clipping, correct 24kHz pacing throughout. `vad_threshold` is now
-     * lowered to `0.15` (much more sensitive) with a new `interruption_delay`
-     * field, plus three fields never tried before at all --
-     * `transcription_mode: "min_latency"`, `continuous_partials: true`,
-     * `voice_focus: null` (per AssemblyAI's own more current example) --
-     * since those are genuinely untested variables, not ones already
-     * eliminated by the defaults-only test above.
+     * clipping, correct 24kHz pacing throughout.
+     *
+     * **2026-09-27 update, cross-checked against AssemblyAI's currently-published Events Reference
+     * (see the class doc's "Wire protocol" section):** `min_silence`/`max_silence`/`interrupt_response`/
+     * `interruption_delay` are not documented `turn_detection` fields at all -- the only ones listed are
+     * `vad_threshold`, `silence_duration_ms`, and `speech_duration_ms`. Since the server produced zero
+     * `session.error` while these unrecognized fields were being sent, it most likely just ignored them
+     * silently rather than rejecting the message -- meaning `turn_detection` has effectively been running
+     * on server defaults (beyond `vad_threshold`) this whole time regardless of what this class intended.
+     * Renamed to the documented field name (`silence_duration_ms`, keeping the same `500`ms value the old
+     * `min_silence` used); `speech_duration_ms` is left unset (server default) since there's no prior value
+     * to carry over and no evidence for what it should be. `voice_focus` is also removed: the Create Agent
+     * API spec's `input` schema doesn't list it as a field at all, so sending `null` for it was never
+     * meaningful. `continuous_partials` went the same way -- also undocumented, and pointless here anyway
+     * since [handleServerMessageOrThrow] deliberately ignores every `transcript.*.delta` event. An `output`
+     * object was added (previously absent) since the docs show `session.update` has both `input` and
+     * `output` format blocks -- this makes the output PCM16/24kHz format explicit rather than relying on
+     * an unconfirmed server default.
      */
     private fun buildInlineSessionUpdate(): JSONObject {
-        val languageCodesArray = JSONArray().apply { languageCodes.forEach { put(it) } }
+        // An unsupported language code here does NOT fail loudly -- it silently prevents the server's
+        // internal STT connect from ever succeeding, so the agent greets normally and then never reacts
+        // to anything the user says. See VoiceAgentLanguages' doc for the full story; omitting the field
+        // (the API's documented default: automatic detection) is strictly safer than forcing a code the
+        // Voice Agent pipeline doesn't handle.
+        val supportedCodes = VoiceAgentLanguages.filterSupported(languageCodes)
+        val dropped = languageCodes.filterNot { VoiceAgentLanguages.isSupported(it) }
+        if (dropped.isNotEmpty()) {
+            traceWarn(
+                "Dropping language code(s) $dropped -- not supported by the Voice Agent API's speech-to-text " +
+                    "(supported: English/Spanish/French/German/Italian/Portuguese). " +
+                    if (supportedCodes.isEmpty()) {
+                        "Sending no language_codes at all, so the server falls back to automatic detection."
+                    } else {
+                        "Sending $supportedCodes instead."
+                    }
+            )
+        }
+        val pcmFormat = JSONObject().put("encoding", "audio/pcm").put("sample_rate", SAMPLE_RATE_HZ)
         val input = JSONObject().apply {
-            put("format", JSONObject().put("encoding", "audio/pcm"))
-            put("language_codes", languageCodesArray)
+            put("format", pcmFormat)
+            if (supportedCodes.isNotEmpty()) {
+                put("language_codes", JSONArray().apply { supportedCodes.forEach { put(it) } })
+            }
             put("transcription_mode", "min_latency")
-            put("continuous_partials", true)
-            put("voice_focus", JSONObject.NULL)
             put(
                 "turn_detection",
                 JSONObject().apply {
                     put("vad_threshold", 0.15)
-                    put("min_silence", 500)
-                    put("max_silence", 1500)
-                    put("interrupt_response", true)
-                    put("interruption_delay", 0)
+                    put("silence_duration_ms", 500)
                 }
             )
+        }
+        val output = JSONObject().apply {
+            put("format", JSONObject().put("encoding", "audio/pcm").put("sample_rate", SAMPLE_RATE_HZ))
         }
         val session = JSONObject().apply {
             put("system_prompt", systemPrompt)
             put("greeting", greeting)
             put("tools", tools)
             put("input", input)
+            put("output", output)
         }
         return JSONObject().put("type", "session.update").put("session", session)
     }
@@ -458,7 +483,6 @@ class VoiceAgentClient @Inject constructor(
         captureJob?.cancel()
         captureJob = null
         stopAudioRecord()
-        stopAudioTrackPlayback()
         webSocket = null
         emit(VoiceAgentEvent.Ended)
     }
@@ -525,26 +549,16 @@ class VoiceAgentClient @Inject constructor(
                 emit(VoiceAgentEvent.Ready)
                 if (!isResume) startAudioCapture()
             }
-            // Real barge-in: flush any of NAVI's own reply audio still playing/queued BEFORE
-            // emitting the event, so a caller reacting to UserSpeechStarted never races against
-            // audio that's about to keep coming out of the speaker anyway -- see stopAgentAudioPlayback's doc.
-            "input.speech.started" -> {
-                stopAgentAudioPlayback(flush = true)
-                emit(VoiceAgentEvent.UserSpeechStarted)
-            }
+            // Barge-in: the caller cuts NAVI's own speech off in response to this (it owns playback now --
+            // see the class doc's "Agent voice" section), so nothing to stop on this side.
+            "input.speech.started" -> emit(VoiceAgentEvent.UserSpeechStarted)
             "input.speech.stopped" -> emit(VoiceAgentEvent.UserSpeechStopped)
             // extractText tries a few plausible field names/nesting, not just a bare "text" key -- see its doc.
             "transcript.user" -> emit(VoiceAgentEvent.UserTranscript(extractText(json)))
             "transcript.agent" -> emit(VoiceAgentEvent.AgentTranscript(extractText(json), json.optBoolean("interrupted", false)))
             // Authoritative "this turn is over" signal -- see VoiceAgentEvent.ReplyDone's doc for why this
             // resets UI state on its own rather than relying only on transcript.agent having parsed correctly.
-            // stopAgentAudioPlayback(flush = false) here too: no more reply.audio chunks are coming for
-            // this turn, so the "NAVI is speaking" window (AgentAudioStarted/Stopped) should end here even
-            // though whatever's still queued in AudioTrack keeps draining out to the speaker naturally.
-            "reply.done" -> {
-                emit(VoiceAgentEvent.ReplyDone)
-                stopAgentAudioPlayback(flush = false)
-            }
+            "reply.done" -> emit(VoiceAgentEvent.ReplyDone)
             "tool.call" -> handleToolCall(json)
             // "error" as an alias for "session.error" -- AssemblyAI support's own reference client checks
             // for both type names on the same error-handling branch. Per support: log the whole event
@@ -565,10 +579,13 @@ class VoiceAgentClient @Inject constructor(
                 trace("session.ended audio_duration_seconds=$audioDurationSeconds -- ${if (audioDurationSeconds == null || audioDurationSeconds == JSONObject.NULL) "server recorded NO audio for this session" else "server did receive audio"}")
                 teardown()
             }
-            "reply.audio" -> handleReplyAudio(json)
+            // reply.audio is deliberately dropped: the agent's synthesized voice is not used at all
+            // (see the class doc's "Agent voice" section -- the caller speaks transcript.agent's text
+            // through the app's own TTS instead, which is the only path that can do Indonesian).
+            "reply.audio" -> Unit
             // Confirmed-real protocol bookkeeping from an actual live session (not just docs) that Pro
             // Mode's UI doesn't need: session.updated (session.update's own ack, arrives before
-            // session.ready), reply.started (a reply is about to stream, redundant with reply.audio/
+            // session.ready), reply.started (a reply is about to stream, redundant with
             // transcript.agent already starting to arrive), transcript.*.delta (word-by-word streaming
             // versions of the transcript.user/transcript.agent finals this class already uses).
             "session.updated", "reply.started", "transcript.agent.delta", "transcript.user.delta" -> Unit
@@ -632,107 +649,6 @@ class VoiceAgentClient @Inject constructor(
             trace("-> tool.result for \"$name\": ${toolResult.toString().take(LOG_MESSAGE_MAX_CHARS)}")
             webSocket?.send(toolResult.toString())
         }
-    }
-
-    // ---- Agent voice playback: reply.audio -> AudioTrack ----
-
-    /**
-     * Decodes one `reply.audio` chunk's base64 PCM16 payload and streams it
-     * straight into [audioTrack] -- this class now plays the agent's own
-     * synthesized voice directly (matching AssemblyAI's bidirectional
-     * "input and output audio are both PCM16 mono 24kHz" spec), replacing
-     * the previous design where [com.apps.naviai.ui.viewmodel.ProModeViewModel]
-     * spoke [VoiceAgentEvent.AgentTranscript]'s text through the app's own
-     * [com.apps.naviai.audio.TextToSpeechManager] instead. [AgentAudioStarted]
-     * fires on the first chunk of a turn (edge-triggered via [agentAudioPlaying])
-     * so callers get one clean "NAVI started talking" signal rather than one
-     * per chunk -- chunks arrive many times per second.
-     */
-    private fun handleReplyAudio(json: JSONObject) {
-        val base64Audio = json.optString("audio")
-        if (base64Audio.isBlank()) return
-        val bytes = runCatching { Base64.decode(base64Audio, Base64.NO_WRAP) }
-            .onFailure { traceWarn("Failed to base64-decode a reply.audio chunk", it) }
-            .getOrNull() ?: return
-        if (bytes.isEmpty()) return
-        val track = runCatching { ensureAudioTrack() }
-            .onFailure { traceError("Failed to create playback AudioTrack", it) }
-            .getOrNull() ?: return
-        if (!agentAudioPlaying) {
-            agentAudioPlaying = true
-            runCatching { track.play() }.onFailure { traceWarn("AudioTrack.play() failed", it) }
-            trace("Agent audio playback started")
-            emit(VoiceAgentEvent.AgentAudioStarted)
-        }
-        runCatching { track.write(bytes, 0, bytes.size) }
-            .onFailure { traceWarn("AudioTrack.write() failed for a reply.audio chunk", it) }
-    }
-
-    /**
-     * Lazily builds the playback [AudioTrack] -- 24kHz mono PCM16 output,
-     * same rate/format as [SAMPLE_RATE_HZ] since AssemblyAI's Voice Agent
-     * API uses the same PCM16/24kHz spec both directions. `USAGE_ASSISTANT`/
-     * `CONTENT_TYPE_SPEECH` (not `USAGE_MEDIA`) so this plays through the
-     * same audio path a voice assistant reply normally would, consistent
-     * with the app's other spoken output.
-     */
-    private fun ensureAudioTrack(): AudioTrack {
-        audioTrack?.let { return it }
-        val minBufferBytes = AudioTrack.getMinBufferSize(SAMPLE_RATE_HZ, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
-        val track = AudioTrack.Builder()
-            .setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_ASSISTANT)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build()
-            )
-            .setAudioFormat(
-                AudioFormat.Builder()
-                    .setSampleRate(SAMPLE_RATE_HZ)
-                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                    .build()
-            )
-            .setBufferSizeInBytes(maxOf(minBufferBytes, CHUNK_BYTES * 4))
-            .setTransferMode(AudioTrack.MODE_STREAM)
-            .build()
-        audioTrack = track
-        return track
-    }
-
-    /**
-     * Ends the current "NAVI is speaking" window. [flush] distinguishes the
-     * two ways this happens: `false` from `reply.done` (no more audio is
-     * coming for this turn, but whatever's already queued in the track
-     * should keep draining out naturally -- stopping it there would cut the
-     * tail end of NAVI's own reply), `true` from a real barge-in
-     * (`input.speech.started` while still playing -- the queued audio must
-     * stop immediately, not finish playing over the user).
-     */
-    private fun stopAgentAudioPlayback(flush: Boolean) {
-        if (!agentAudioPlaying && !flush) return
-        val wasPlaying = agentAudioPlaying
-        agentAudioPlaying = false
-        if (flush) {
-            runCatching {
-                audioTrack?.pause()
-                audioTrack?.flush()
-                audioTrack?.play()
-            }.onFailure { traceWarn("Failed to flush agent audio playback for barge-in", it) }
-        }
-        if (wasPlaying) {
-            trace("Agent audio playback stopped (flush=$flush)")
-            emit(VoiceAgentEvent.AgentAudioStopped)
-        }
-    }
-
-    private fun stopAudioTrackPlayback() {
-        audioTrack?.apply {
-            runCatching { stop() }
-            runCatching { release() }
-        }
-        audioTrack = null
-        agentAudioPlaying = false
     }
 
     private fun emit(event: VoiceAgentEvent) {

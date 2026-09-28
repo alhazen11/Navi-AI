@@ -24,6 +24,21 @@ class AnnouncementManager @Inject constructor(private val tts: Speaker) {
     var minRiskToAnnounce: RiskLevel = RiskLevel.LOW
 
     /**
+     * How many times in a row each track has already been announced at its current risk level,
+     * driving [cooldownFor]'s backoff. A stationary object that stays in view was otherwise
+     * re-announced every [normalCooldownMs] forever: on-device logs of Offline Mode showed one
+     * unchanged object producing an announcement every ~4 seconds indefinitely, which left no
+     * acoustic gap long enough for the user to say a voice command into (see
+     * [com.apps.naviai.audio.VoiceCommandManager]'s self-voice rejection -- the mic is muted for
+     * every one of those). Reset when that track's risk level rises, so a hazard that actually
+     * gets worse is announced promptly again rather than inheriting a long backoff.
+     */
+    private val repeatCounts = mutableMapOf<Int, Int>()
+
+    /** Risk level each track was last announced at -- see [repeatCounts]. */
+    private val lastAnnouncedRisk = mutableMapOf<Int, RiskLevel>()
+
+    /**
      * @param speak When false, announcements are still computed (and
      *   [onAnnounced] still fires, so cooldowns keep advancing normally) but
      *   never actually spoken -- for when the caller has a richer
@@ -42,6 +57,16 @@ class AnnouncementManager @Inject constructor(private val tts: Speaker) {
         speak: Boolean = true,
         onAnnounced: (trackingId: Int, atMs: Long) -> Unit
     ): List<Announcement> {
+        // Forget tracks that are gone, and drop the backoff for any whose risk just rose -- see
+        // repeatCounts' doc.
+        val presentIds = trackedObjects.mapTo(mutableSetOf()) { it.trackingId }
+        repeatCounts.keys.retainAll(presentIds)
+        lastAnnouncedRisk.keys.retainAll(presentIds)
+        trackedObjects.forEach { tracked ->
+            val previousRisk = lastAnnouncedRisk[tracked.trackingId] ?: return@forEach
+            if (tracked.riskLevel.priority > previousRisk.priority) repeatCounts[tracked.trackingId] = 0
+        }
+
         val toAnnounce = trackedObjects
             .filter { it.riskLevel.priority >= minRiskToAnnounce.priority }
             .filter { it.framesTracked >= MIN_FRAMES_BEFORE_ANNOUNCE }
@@ -63,14 +88,29 @@ class AnnouncementManager @Inject constructor(private val tts: Speaker) {
             onAnnounced(announcement.trackingId, nowMs)
             if (speak) tts.speak(announcement.text, announcement.isUrgent, "track_${announcement.trackingId}_$nowMs")
         }
+        toAnnounce.forEach { tracked ->
+            repeatCounts[tracked.trackingId] = (repeatCounts[tracked.trackingId] ?: 0) + 1
+            lastAnnouncedRisk[tracked.trackingId] = tracked.riskLevel
+        }
 
         return announcements
     }
 
     private fun shouldAnnounce(tracked: TrackedObject, nowMs: Long): Boolean {
         val last = tracked.lastAnnouncedAtMs ?: return true
-        val cooldown = if (tracked.riskLevel == RiskLevel.CRITICAL) criticalCooldownMs else normalCooldownMs
-        return nowMs - last >= cooldown
+        return nowMs - last >= cooldownFor(tracked)
+    }
+
+    /**
+     * CRITICAL is deliberately exempt from the backoff and keeps [criticalCooldownMs] however many
+     * times it repeats -- something that close should keep saying so. Everything else stretches its
+     * cooldown with each repeat of the SAME object at the SAME risk (see [repeatCounts]).
+     */
+    private fun cooldownFor(tracked: TrackedObject): Long {
+        if (tracked.riskLevel == RiskLevel.CRITICAL) return criticalCooldownMs
+        val repeats = repeatCounts[tracked.trackingId] ?: 0
+        val multiplier = REPEAT_BACKOFF_MULTIPLIERS.getOrElse(repeats) { REPEAT_BACKOFF_MULTIPLIERS.last() }
+        return (normalCooldownMs * multiplier).toLong()
     }
 
     private fun buildSentence(tracked: TrackedObject, language: AnnouncementLanguage): String {
@@ -146,6 +186,9 @@ class AnnouncementManager @Inject constructor(private val tts: Speaker) {
     private companion object {
         const val MIN_FRAMES_BEFORE_ANNOUNCE = 2
         const val MAX_ANNOUNCEMENTS_PER_PASS = 3
+
+        /** Multipliers applied to [normalCooldownMs] per consecutive repeat -- with the 4s default: 4s, then 8s, then 15s from the third repeat on. See [repeatCounts]. */
+        val REPEAT_BACKOFF_MULTIPLIERS = listOf(1.0f, 2.0f, 3.75f)
 
         val INDONESIAN_NUMBERS = mapOf(
             1 to "satu", 2 to "dua", 3 to "tiga", 4 to "empat", 5 to "lima",

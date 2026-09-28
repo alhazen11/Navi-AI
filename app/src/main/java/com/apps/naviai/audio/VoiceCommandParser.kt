@@ -19,7 +19,7 @@ object VoiceCommandParser {
      * "navi". "Navy" is accepted as an equivalent alias for exactly that
      * reason; it is not a second word users need to remember to say.
      */
-    val DEFAULT_WAKE_WORDS = listOf("navi", "navy","nafi", "na vi", "na fi", "na vy")
+    val DEFAULT_WAKE_WORDS = listOf("navi", "now we", "navy", "nafi", "navi, ", "now we, ", "navy, ", "nafi, ", "na vi", "na fi", "na vy", "na vi, ", "na fi, ", "na vy, ")
 
     /**
      * @return the command text following whichever wake word matched
@@ -53,7 +53,7 @@ object VoiceCommandParser {
     fun mentionsWakeWord(text: String, wakeWords: List<String> = DEFAULT_WAKE_WORDS): Boolean {
         val lower = text.lowercase()
         return wakeWords.any { wakeWord ->
-            Regex("\\b${Regex.escape(wakeWord.lowercase())}\\b").containsMatchIn(lower)
+            Regex("\\b${wakeWord.lowercase()}\\b").containsMatchIn(lower)
         }
     }
 }

@@ -8,6 +8,8 @@ import com.apps.naviai.audio.VoiceCommandManager
 import com.apps.naviai.audio.VoiceCommandStatus
 import com.apps.naviai.database.RoutePointEntity
 import com.apps.naviai.database.RouteRepository
+import com.apps.naviai.navigation.GoHomeCommandMatcher
+import com.apps.naviai.navigation.GoHomeSignal
 import com.apps.naviai.settings.SettingsRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -45,7 +47,8 @@ class RecordingViewModel @Inject constructor(
     private val routeRepository: RouteRepository,
     private val voiceCommandManager: VoiceCommandManager,
     private val ttsManager: TextToSpeechManager,
-    private val settingsRepository: SettingsRepository
+    private val settingsRepository: SettingsRepository,
+    private val goHomeSignal: GoHomeSignal
 ) : ViewModel() {
 
     @Volatile private var language = AnnouncementLanguage.INDONESIAN
@@ -72,6 +75,8 @@ class RecordingViewModel @Inject constructor(
                 val command = voiceState.command ?: return@collect
                 lastHandledVoiceEventId = voiceState.eventId
                 when {
+                    // Checked first: a global reset takes priority over this screen's own commands.
+                    GoHomeCommandMatcher.isMatch(command) -> goHome()
                     RouteRecordingMatcher.isStart(command) -> startRecording()
                     RouteRecordingMatcher.isStop(command) -> stopRecordingAndAskName()
                 }
@@ -92,6 +97,26 @@ class RecordingViewModel @Inject constructor(
         voiceCommandManager.cancelPendingRawUtterance()
         pendingPoints = emptyList()
         _uiState.update { it.copy(awaitingRouteName = false) }
+    }
+
+    /**
+     * "NAVI, kembali" / "kembali ke home" -- see [GoHomeCommandMatcher] and [GoHomeSignal]'s docs.
+     * An in-progress recording is discarded, not saved: this is a reset command, not an alternate
+     * phrasing of "stop merekam jalan" (which still asks for a name and saves). Mid name-capture
+     * dialogue is cancelled the same way [cancelPendingRouteName] already does for its own Cancel
+     * button, so the points already stopped-and-pending don't get saved under whatever this
+     * "kembali" utterance itself would otherwise be misheard as a name for.
+     */
+    private fun goHome() {
+        if (routeRecorder.isRecording) routeRecorder.stop()
+        if (_uiState.value.awaitingRouteName) cancelPendingRouteName()
+        speak(goingHomeMessage(language))
+        goHomeSignal.trigger()
+    }
+
+    private fun goingHomeMessage(language: AnnouncementLanguage): String = when (language) {
+        AnnouncementLanguage.INDONESIAN -> "Kembali ke beranda."
+        AnnouncementLanguage.ENGLISH -> "Returning to Home."
     }
 
     private fun startRecording() {
@@ -117,7 +142,7 @@ class RecordingViewModel @Inject constructor(
 
     private fun onRouteNameCaptured(rawName: String) {
         _uiState.update { it.copy(awaitingRouteName = false) }
-        val name = rawName.trim().replace(".","")
+        val name = rawName.trim().replace(".","").replace(Regex(".*as "),"")
         val points = pendingPoints
         pendingPoints = emptyList()
 

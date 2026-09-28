@@ -2,6 +2,7 @@ package com.apps.naviai.audio
 
 import android.content.Context
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.util.Log
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -31,6 +32,22 @@ class TextToSpeechManager @Inject constructor(@ApplicationContext context: Conte
     private val _availability = MutableStateFlow(TtsAvailability.UNKNOWN)
     val availability: StateFlow<TtsAvailability> = _availability.asStateFlow()
 
+    private val _isSpeaking = MutableStateFlow(false)
+
+    /**
+     * True while the engine is actually speaking, driven by
+     * [UtteranceProgressListener] rather than a duration estimate.
+     *
+     * Pro Mode needs this: its microphone stays open continuously, so it has
+     * to know exactly when NAVI's own voice is coming out of the speaker to
+     * avoid feeding it back to the voice agent as if the user had said it
+     * (see [com.apps.naviai.ui.viewmodel.ProModeViewModel]). The regular
+     * pipeline's older workaround for the same problem was a fixed ~3s mute
+     * window, which either cuts off early or mutes too long depending on how
+     * much there was to say.
+     */
+    override val isSpeaking: StateFlow<Boolean> = _isSpeaking.asStateFlow()
+
     private var engine: TextToSpeech? = null
 
     init {
@@ -47,7 +64,32 @@ class TextToSpeechManager @Inject constructor(@ApplicationContext context: Conte
             Log.w(TAG, "TextToSpeech unavailable on this device", t)
             null
         }
-        if (engine == null) _availability.value = TtsAvailability.UNAVAILABLE
+        if (engine == null) {
+            _availability.value = TtsAvailability.UNAVAILABLE
+        } else {
+            engine?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                override fun onStart(utteranceId: String?) {
+                    _isSpeaking.value = true
+                }
+
+                override fun onDone(utteranceId: String?) {
+                    _isSpeaking.value = false
+                }
+
+                @Deprecated("Superseded by onError(String, int), which the platform calls instead where available")
+                override fun onError(utteranceId: String?) {
+                    _isSpeaking.value = false
+                }
+
+                override fun onError(utteranceId: String?, errorCode: Int) {
+                    _isSpeaking.value = false
+                }
+
+                override fun onStop(utteranceId: String?, interrupted: Boolean) {
+                    _isSpeaking.value = false
+                }
+            })
+        }
     }
 
     /** Returns false if the language/voice data isn't installed; caller should fall back. */
@@ -77,12 +119,16 @@ class TextToSpeechManager @Inject constructor(@ApplicationContext context: Conte
 
     override fun stop() {
         engine?.stop()
+        // stop() does not always deliver onStop for already-flushed utterances, so clear this
+        // directly -- a stuck-true isSpeaking would keep Pro Mode's mic muted indefinitely.
+        _isSpeaking.value = false
     }
 
     fun shutdown() {
         engine?.stop()
         engine?.shutdown()
         engine = null
+        _isSpeaking.value = false
         _availability.value = TtsAvailability.UNAVAILABLE
     }
 

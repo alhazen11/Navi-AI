@@ -34,32 +34,14 @@ sealed interface VoiceAgentEvent {
     data class UserTranscript(val text: String) : VoiceAgentEvent
 
     /**
-     * A finalized agent reply's text (`transcript.agent`), for the on-screen
-     * transcript only -- [VoiceAgentClient] plays the agent's own
-     * synthesized voice itself (`reply.audio`, decoded and streamed through
-     * an internal `AudioTrack`), so the caller (see
-     * [com.apps.naviai.ui.viewmodel.ProModeViewModel]) never needs to speak
-     * this text through [com.apps.naviai.audio.TextToSpeechManager] --
-     * see [AgentAudioStarted]/[AgentAudioStopped] for the actual "NAVI is
-     * speaking" signal, which is driven by real playback, not this event.
+     * A finalized agent reply's text (`transcript.agent`) -- both what the
+     * on-screen transcript shows AND what gets spoken: [VoiceAgentClient]
+     * drops the agent's own synthesized voice, so the caller speaks this
+     * through [com.apps.naviai.audio.TextToSpeechManager] (see that class's
+     * "Agent voice" doc for why). [interrupted] is the server's own flag for
+     * a reply the user talked over, so the text may be incomplete.
      */
     data class AgentTranscript(val text: String, val interrupted: Boolean) : VoiceAgentEvent
-
-    /**
-     * The agent's own synthesized voice (`reply.audio`) started playing
-     * through [VoiceAgentClient]'s internal `AudioTrack` -- the real
-     * "NAVI is speaking" signal callers should use to mute the mic (on
-     * devices without echo cancellation) and show a "Speaking…" state,
-     * replacing any text-length-based estimate.
-     */
-    data object AgentAudioStarted : VoiceAgentEvent
-
-    /**
-     * The agent's own synthesized voice finished playing -- either the
-     * buffered audio fully drained after [ReplyDone], or it was cut short
-     * by a real barge-in ([UserSpeechStarted] flushes it immediately).
-     */
-    data object AgentAudioStopped : VoiceAgentEvent
 
     /** The agent invoked one of the registered tools -- shown in the UI as "using <name>...". */
     data class ToolInvoked(val name: String) : VoiceAgentEvent

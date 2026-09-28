@@ -22,6 +22,7 @@ import kotlin.math.abs
  */
 object HazardTrigger {
     fun isBlockingHazard(
+        label: String,
         boxWidth: Float,
         boxHeight: Float,
         boxCenterX: Float,
@@ -29,6 +30,7 @@ object HazardTrigger {
         frameHeight: Int,
         riskLevel: RiskLevel
     ): Boolean {
+        if (label !in HAZARD_ELIGIBLE_LABELS) return false
         if (frameWidth <= 0 || frameHeight <= 0) return false
         if (riskLevel.priority < RiskLevel.MEDIUM.priority) return false
 
@@ -46,4 +48,23 @@ object HazardTrigger {
 
     /** Same "directly ahead" width fraction RiskAssessmentEngine's default sensitivity uses. */
     private const val PATH_WIDTH_FRACTION = 0.45f
+
+    /**
+     * Only these COCO labels (see assets/models/coco.names) can ever fire a
+     * hazard supplement, regardless of size/position/risk -- product
+     * requirement is to keep the LLM call limited to plausible walking-path
+     * obstacles/traffic actors/animals, not every large centered detection
+     * (e.g. a "dining table" or "bed" should never trigger this). Two labels
+     * requested alongside these ("scooter", "trash/bin") aren't part of the
+     * model's 80-class COCO output, so they can't be matched here.
+     */
+    private val HAZARD_ELIGIBLE_LABELS = setOf(
+        "person", "bicycle", "motorcycle", "car", "bus", "truck",
+        "bench", "chair", "couch", "dog", "horse",
+        "traffic light", "fire hydrant", "stop sign", "parking meter", "potted plant",
+        "backpack", "suitcase", "umbrella", "handbag",
+        "skateboard", "sports ball", "kite", "surfboard",
+        "bird", "cat", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "tv",
+        "refrigerator"
+    )
 }

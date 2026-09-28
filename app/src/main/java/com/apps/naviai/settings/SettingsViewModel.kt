@@ -34,7 +34,13 @@ data class SettingsUiState(
      * comes back, with nothing to undo.
      */
     val effectiveOfflineModeEnabled: Boolean = false,
-    /** True when [effectiveOfflineModeEnabled] is on ONLY because of no internet, not because the user's own saved preference is -- the switch is shown disabled in this state (see SettingsScreen), since toggling it wouldn't change anything real while there's still no connectivity. */
+    /**
+     * True when [effectiveOfflineModeEnabled] is on ONLY because of no internet, not because the
+     * user's own saved preference is. The switch stays interactive in this state (see
+     * SettingsScreen) -- it can't visibly move while connectivity pins it on, but the preference
+     * underneath is still the user's to set and is what takes over once the network returns, so
+     * SettingsScreen's caption spells out which way that preference is currently set.
+     */
     val offlineModeForcedByNoInternet: Boolean = false
 )
 

@@ -18,6 +18,7 @@ private class FakeSpeaker : Speaker {
         spoken += Triple(text, flushQueue, utteranceId)
     }
     override fun stop() { spoken.clear() }
+    override val isSpeaking = kotlinx.coroutines.flow.MutableStateFlow(false)
 }
 
 @RunWith(RobolectricTestRunner::class)

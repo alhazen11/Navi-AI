@@ -7,10 +7,15 @@ import android.os.Looper
 import android.util.Log
 import com.apps.naviai.core.common.NetworkMonitor
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -89,6 +94,20 @@ data class VoiceCommandUiState(
  * connectivity changing *during* an active session, not only at the moment
  * listening starts, since that's the realistic way connectivity changes
  * for someone moving around outdoors.
+ *
+ * **Self-voice rejection**: [init] subscribes to [speaker]'s [Speaker.isSpeaking] and
+ * auto-mutes/unmutes the active [transcriber] to match, in real time -- so NAVI's own voice never
+ * gets fed back into the mic as if the user had said it, regardless of which call site triggered
+ * the speech, including every OTHER `ttsManager.speak(...)` call in the app (Scene
+ * Understanding/Text Reading/Object Search/Hazard results, route-not-found messages, etc.) that
+ * never went through this class at all. This is the SOLE muting mechanism now -- the four call
+ * sites that need to run something once NAVI finishes talking
+ * ([speakMuted]/[speakThenAwaitRawUtterance]/[promptRepeat]/[speakRecognizedCommand]) use
+ * [afterSpeaking] to wait for the real end of speech instead of guessing a fixed duration and
+ * calling `setMuted(false)` themselves: that used to unmute early on anything longer than the old
+ * ~2s guess (e.g. the "please repeat" prompt), reopening the mic mid-sentence and letting NAVI's
+ * own tail end of speech get transcribed as if the user had said it -- the self-voice rejection
+ * this class exists to prevent, happening from inside the very code meant to prevent it.
  */
 @Singleton
 class VoiceCommandManager @Inject constructor(
@@ -97,14 +116,87 @@ class VoiceCommandManager @Inject constructor(
     httpClient: OkHttpClient,
     @ApplicationContext context: Context
 ) {
+    // Dispatchers.Main.immediate: setMuted() below must reach whichever VoiceTranscriber is
+    // currently active without waiting for a thread hop, same reasoning as
+    // com.apps.naviai.routenav.NavigationController's own scope.
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+
     private val cloudTranscriber: VoiceTranscriber = AssemblyAiBatchTranscriber(httpClient)
     private val onDeviceTranscriber: VoiceTranscriber = AndroidSpeechRecognizerTranscriber(context)
 
     /** Whichever engine is currently active -- see the class doc's "Engine switching" note. */
     private var transcriber: VoiceTranscriber = cloudTranscriber
 
+    init {
+        // See the class doc's "Self-voice rejection" section. Reads the CURRENT transcriber var
+        // (not a captured reference) on every emission, so this stays correct across an engine
+        // switch (Offline Mode toggling mid-session) too.
+        scope.launch {
+            speaker.isSpeaking.collect { speaking ->
+                Log.d(TAG, "TTS isSpeaking=$speaking -- ${if (speaking) "muting" else "unmuting"} the mic")
+                transcriber.setMuted(speaking)
+            }
+        }
+    }
+
+    /**
+     * Runs [action] once [speaker] genuinely finishes speaking whatever was just queued --
+     * waits for [Speaker.isSpeaking] to go true (confirms playback actually started, so a
+     * currently-false read isn't mistaken for "already done" before TTS even begins) and then
+     * false (confirms it ended), instead of the old fixed-duration guess. See the class doc's
+     * "Self-voice rejection" section for why that guess was actively wrong for anything longer
+     * than it assumed.
+     */
+    private fun afterSpeaking(action: () -> Unit) {
+        scope.launch {
+            speaker.isSpeaking.first { it }
+            speaker.isSpeaking.first { !it }
+            action()
+        }
+    }
+
     private val _state = MutableStateFlow(VoiceCommandUiState())
     val state: StateFlow<VoiceCommandUiState> = _state.asStateFlow()
+
+    private val _userSpeaking = MutableStateFlow(false)
+
+    /**
+     * True from the moment the active [transcriber] reports the USER has started speaking (see
+     * [VoiceTranscriber.setUserSpeechListener]) until that utterance resolves. Exists so the rest
+     * of the app can avoid speaking over a command already in progress -- specifically
+     * [com.apps.naviai.ui.viewmodel.DetectionViewModel], which otherwise kept announcing detected
+     * objects every few seconds straight through whatever the user was saying. On-device logs of
+     * Offline Mode showed exactly that killing every command: the user would start a sentence, two
+     * hazard announcements would play over it, and the recognizer returned ERROR_NO_MATCH on the
+     * garbled overlap every time.
+     *
+     * Cleared by the terminal event of the utterance ([BatchTranscriptEvent.Result]/
+     * [BatchTranscriptEvent.Error]/[BatchTranscriptEvent.Listening]), plus a
+     * [MAX_USER_SPEECH_MS] failsafe so a dropped terminal event can never leave the app
+     * permanently silent.
+     */
+    val userSpeaking: StateFlow<Boolean> = _userSpeaking.asStateFlow()
+
+    /**
+     * True while NAVI itself is talking, i.e. while the mic is muted by self-voice rejection (see
+     * the class doc's matching section). Re-exposed straight from [speaker] so UI can show that
+     * state honestly -- [VoiceCommandStatus] has no value for it, so a panel reading only [state]
+     * would keep claiming "Listening" throughout every announcement.
+     */
+    val naviSpeaking: StateFlow<Boolean> = speaker.isSpeaking
+
+    private val userSpeechTimeout = Runnable { _userSpeaking.value = false }
+
+    private fun onUserSpeechStarted() {
+        _userSpeaking.value = true
+        mainHandler.removeCallbacks(userSpeechTimeout)
+        mainHandler.postDelayed(userSpeechTimeout, MAX_USER_SPEECH_MS)
+    }
+
+    private fun clearUserSpeaking() {
+        mainHandler.removeCallbacks(userSpeechTimeout)
+        _userSpeaking.value = false
+    }
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var language = AnnouncementLanguage.INDONESIAN
@@ -181,6 +273,7 @@ class VoiceCommandManager @Inject constructor(
             }
             active = true
             if (fallenBackDueToNoInternet) Log.d(TAG, "No internet connectivity detected -- using on-device recognizer even though Offline Mode isn't manually on")
+            transcriber.setUserSpeechListener { mainHandler.post { onUserSpeechStarted() } }
             transcriber.start(null, language) { event -> mainHandler.post { handleEvent(event) } }
             return
         }
@@ -202,12 +295,14 @@ class VoiceCommandManager @Inject constructor(
             return
         }
         active = true
+        transcriber.setUserSpeechListener { mainHandler.post { onUserSpeechStarted() } }
         transcriber.start(apiKey, language) { event -> mainHandler.post { handleEvent(event) } }
     }
 
     /** Stops listening entirely; no further auto-restart until [startContinuousListening] is called again. */
     fun stopListening() {
         active = false
+        clearUserSpeaking()
         mainHandler.removeCallbacksAndMessages(null)
         pendingRawUtteranceCallback = null
         transcriber.setWakeWordBoostEnabled(true)
@@ -219,6 +314,7 @@ class VoiceCommandManager @Inject constructor(
 
     fun reset() {
         active = false
+        clearUserSpeaking()
         mainHandler.removeCallbacksAndMessages(null)
         pendingRawUtteranceCallback = null
         transcriber.setWakeWordBoostEnabled(true)
@@ -229,10 +325,17 @@ class VoiceCommandManager @Inject constructor(
     private fun handleEvent(event: BatchTranscriptEvent) {
         if (!active) return
         when (event) {
-            is BatchTranscriptEvent.Listening -> _state.update { it.copy(status = VoiceCommandStatus.LISTENING, message = null) }
+            is BatchTranscriptEvent.Listening -> {
+                clearUserSpeaking()
+                _state.update { it.copy(status = VoiceCommandStatus.LISTENING, message = null) }
+            }
             is BatchTranscriptEvent.Transcribing -> _state.update { it.copy(status = VoiceCommandStatus.TRANSCRIBING, message = null) }
-            is BatchTranscriptEvent.Result -> handleFinalTranscript(event.transcript)
+            is BatchTranscriptEvent.Result -> {
+                clearUserSpeaking()
+                handleFinalTranscript(event.transcript)
+            }
             is BatchTranscriptEvent.Error -> {
+                clearUserSpeaking()
                 Log.w(TAG, "Transcriber error (fatal=${event.fatal}): ${event.message}")
                 // A non-fatal (per-utterance) error is always immediately
                 // followed by a Listening event from the capture loop --
@@ -275,55 +378,29 @@ class VoiceCommandManager @Inject constructor(
     }
 
     /**
-     * Speaks [prompt] with the mic muted (so the batch transcriber can't
-     * pick up NAVI's own prompt audio and mistake it for the user's
-     * answer -- the same problem [promptRepeat] solves for its own
-     * internal prompt), then unmutes and starts listening for the NEXT
-     * utterance via [awaitNextRawUtterance] once the mute window has
-     * elapsed. For external callers that need a "ask a question via TTS,
-     * then capture the spoken answer" dialogue step -- Route Recording's
-     * "what should I name this route?" and Conversation Memory's "are you
-     * sure you want to delete everything?" both used to call
-     * [awaitNextRawUtterance] immediately after speaking, with no mute at
-     * all, so the mic reliably captured NAVI's own prompt as the "answer"
-     * instead of waiting for the user.
-     *
-     * The mute window is sized to [prompt]'s length, not a single fixed
-     * constant like [MUTE_DURING_PROMPT_MS] -- these dialogue prompts run
-     * noticeably longer than the short acknowledgements that constant was
-     * tuned for, and there's no actual TTS-completion callback wired up
-     * (see [Speaker]'s minimal interface) to know precisely when speech
-     * really finishes.
+     * Speaks [prompt] (the [init] auto-mute collector keeps the mic muted for as long as it's
+     * actually playing -- see the class doc), then starts listening for the NEXT utterance via
+     * [awaitNextRawUtterance] once speech genuinely finishes (see [afterSpeaking]). For external
+     * callers that need a "ask a question via TTS, then capture the spoken answer" dialogue step
+     * -- Route Recording's "what should I name this route?" and Conversation Memory's "are you
+     * sure you want to delete everything?" both used to call [awaitNextRawUtterance] immediately
+     * after speaking, with no mute at all, so the mic reliably captured NAVI's own prompt as the
+     * "answer" instead of waiting for the user.
      */
     fun speakThenAwaitRawUtterance(prompt: String, onUtterance: (String) -> Unit) {
-        transcriber.setMuted(true)
         speaker.speak(prompt, flushQueue = false, utteranceId = "voice_dialogue_prompt")
-        mainHandler.postDelayed({
-            transcriber.setMuted(false)
-            awaitNextRawUtterance(onUtterance)
-        }, estimatedSpeechDurationMs(prompt))
+        afterSpeaking { awaitNextRawUtterance(onUtterance) }
     }
 
-    /** Rough length-based estimate of how long TTS will take to speak [text] -- see [speakThenAwaitRawUtterance]'s doc for why this isn't exact. */
-    private fun estimatedSpeechDurationMs(text: String): Long =
-        (text.length * MS_PER_CHARACTER_ESTIMATE).coerceIn(MIN_PROMPT_MUTE_MS, MAX_PROMPT_MUTE_MS)
-
     /**
-     * Speaks [text] with the mic muted for roughly as long as it takes to
-     * say it, then unmutes -- for a one-off status/confirmation message
-     * that ISN'T asking a question (no [awaitNextRawUtterance] callback
-     * registered afterward; see [speakThenAwaitRawUtterance] for the
-     * "asking a question" case). Without this, e.g. Route Recording's "Rute
-     * X berhasil disimpan." confirmation got picked up by the still-active
-     * mic and transcribed as new (ambient, harmlessly ignored, but wasted)
-     * input the moment it finished saving -- same self-listening problem
-     * as the dialogue prompts, just on the "I'm done" side instead of the
-     * "here's my question" side.
+     * Speaks [text] -- for a one-off status/confirmation message that ISN'T asking a question (no
+     * [awaitNextRawUtterance] callback needed after; see [speakThenAwaitRawUtterance] for the
+     * "asking a question" case). Muting while it plays is handled entirely by [init]'s auto-mute
+     * collector now (see the class doc) -- this wrapper exists mainly so call sites read as
+     * intentionally-muted-by-design rather than a bare [Speaker.speak] call.
      */
     fun speakMuted(text: String) {
-        transcriber.setMuted(true)
         speaker.speak(text, flushQueue = false, utteranceId = "voice_muted_message")
-        mainHandler.postDelayed({ transcriber.setMuted(false) }, estimatedSpeechDurationMs(text))
     }
 
     private fun handleFinalTranscript(text: String) {
@@ -369,32 +446,24 @@ class VoiceCommandManager @Inject constructor(
      * only an audible acknowledgement that recognition worked.
      */
     private fun speakRecognizedCommand(command: String) {
-        // Same reasoning as promptRepeat(): stop forwarding mic audio while
-        // NAVI speaks, so it doesn't pick up its own voice as a new
-        // "command".
-
-        transcriber.setMuted(true)
-        if (command.isBlank()){
-            speaker.speak( emptyCommandMessage(language), flushQueue = false, utteranceId = "voice_command_recognized")
+        // Muting while this plays is handled by init's auto-mute collector (see the class doc);
+        // nothing to wait for afterward since no dialogue step follows.
+        if (command.isBlank()) {
+            speaker.speak(emptyCommandMessage(language), flushQueue = false, utteranceId = "voice_command_recognized")
         }
-        mainHandler.postDelayed({ transcriber.setMuted(false) }, MUTE_DURING_PROMPT_MS)
     }
 
     private fun promptRepeat(rawText: String?) {
         val message = repeatPromptMessage(language)
         _state.value = VoiceCommandUiState(status = VoiceCommandStatus.UNCLEAR, rawRecognizedText = rawText, message = message)
 
-        // Stop forwarding mic audio while NAVI speaks the prompt, so it
-        // doesn't pick up its own voice as new input -- reduces, doesn't
-        // eliminate (no true echo cancellation), that risk.
-        transcriber.setMuted(true)
+        // Muting while this plays is handled by init's auto-mute collector (see the class doc).
         speaker.speak(message, flushQueue = false, utteranceId = "voice_command_repeat_prompt")
-        mainHandler.postDelayed({
-            transcriber.setMuted(false)
+        afterSpeaking {
             if (active) {
                 _state.update { if (it.status == VoiceCommandStatus.UNCLEAR) it.copy(status = VoiceCommandStatus.LISTENING, message = null) else it }
             }
-        }, MUTE_DURING_PROMPT_MS)
+        }
     }
 
 
@@ -428,12 +497,7 @@ class VoiceCommandManager @Inject constructor(
     private companion object {
         const val TAG = "VoiceCommandManager"
 
-        /** How long to keep the mic muted after speaking a prompt/confirmation. */
-        const val MUTE_DURING_PROMPT_MS = 2000L
-
-        /** Rough average speaking pace used to size [speakThenAwaitRawUtterance]'s mute window -- not exact, just a reasonable per-character estimate. */
-        const val MS_PER_CHARACTER_ESTIMATE = 90L
-        const val MIN_PROMPT_MUTE_MS = 2000L
-        const val MAX_PROMPT_MUTE_MS = 8000L
+        /** Failsafe clearing [userSpeaking] if an utterance's terminal event never arrives -- see that property's doc. Comfortably longer than any single spoken command. */
+        const val MAX_USER_SPEECH_MS = 12_000L
     }
 }

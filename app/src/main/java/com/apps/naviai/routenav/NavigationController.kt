@@ -10,6 +10,8 @@ import com.apps.naviai.database.RouteRepository
 import com.apps.naviai.compass.CompassManager
 import com.apps.naviai.location.LocationPermission
 import com.apps.naviai.location.LocationProvider
+import com.apps.naviai.navigation.GoHomeCommandMatcher
+import com.apps.naviai.navigation.GoHomeSignal
 import com.apps.naviai.settings.SettingsRepository
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
@@ -58,7 +60,8 @@ class NavigationController @Inject constructor(
     private val compassManager: CompassManager,
     private val ttsManager: TextToSpeechManager,
     private val voiceCommandManager: VoiceCommandManager,
-    private val settingsRepository: SettingsRepository
+    private val settingsRepository: SettingsRepository,
+    private val goHomeSignal: GoHomeSignal
 ) {
     private val _phase = MutableStateFlow<NavigationUiPhase>(NavigationUiPhase.Idle)
     val phase: StateFlow<NavigationUiPhase> = _phase.asStateFlow()
@@ -104,8 +107,14 @@ class NavigationController @Inject constructor(
      * isn't granted -- see [LocationPermission]'s doc and
      * [com.apps.naviai.recording.RouteRecorder.start] for the same guard
      * on the recording side.
+     *
+     * [listenForVoiceCommands] (see [RouteNavigationService.start]'s doc): false when navigation
+     * was started from Pro Mode, which already owns the mic exclusively through
+     * [com.apps.naviai.voiceagent.VoiceAgentClient] -- skips starting [voiceCommandManager]'s own
+     * listening and this class's own "stop navigasi" collector entirely, rather than opening a
+     * second capture engine on the same microphone underneath Pro Mode's.
      */
-    fun start(routeName: String) {
+    fun start(routeName: String, listenForVoiceCommands: Boolean = true) {
         // job?.isActive (not just the isActive PROPERTY above) guards
         // against a second start() call arriving before the first GPS fix
         // ever comes in -- the isActive property only flips true once
@@ -125,13 +134,20 @@ class NavigationController @Inject constructor(
         }
         resetAnnouncementState()
 
-        voiceCommandManager.startContinuousListening(language, apiKey, offlineModeEnabled)
-        voiceJob = scope.launch {
-            voiceCommandManager.state.collect { voiceState ->
-                if (voiceState.status != VoiceCommandStatus.RECOGNIZED || voiceState.eventId == lastHandledVoiceEventId) return@collect
-                val command = voiceState.command ?: return@collect
-                lastHandledVoiceEventId = voiceState.eventId
-                if (NavigationCommandMatcher.isStop(command)) stopAndDismissService(spokenConfirmation = true)
+        if (listenForVoiceCommands) {
+            voiceCommandManager.startContinuousListening(language, apiKey, offlineModeEnabled)
+            voiceJob = scope.launch {
+                voiceCommandManager.state.collect { voiceState ->
+                    if (voiceState.status != VoiceCommandStatus.RECOGNIZED || voiceState.eventId == lastHandledVoiceEventId) return@collect
+                    val command = voiceState.command ?: return@collect
+                    lastHandledVoiceEventId = voiceState.eventId
+                    // Checked first: a global reset takes priority over this feature's own "stop navigasi".
+                    if (GoHomeCommandMatcher.isMatch(command)) {
+                        goHome()
+                    } else if (NavigationCommandMatcher.isStop(command)) {
+                        stopAndDismissService(spokenConfirmation = true)
+                    }
+                }
             }
         }
 
@@ -297,6 +313,22 @@ class NavigationController @Inject constructor(
     private fun stopAndDismissService(spokenConfirmation: Boolean) {
         stop(spokenConfirmation)
         RouteNavigationService.stop(context, spokenConfirmation = false)
+    }
+
+    /**
+     * "NAVI, kembali" / "kembali ke home" -- see [GoHomeCommandMatcher] and [GoHomeSignal]'s docs.
+     * `spokenConfirmation = false` on the stop itself: this speaks its own single "Kembali ke
+     * beranda" line instead, rather than that plus "Navigasi dihentikan" back to back.
+     */
+    private fun goHome() {
+        stopAndDismissService(spokenConfirmation = false)
+        ttsManager.speak(goingHomeMessage(language), flushQueue = true, utteranceId = "nav_go_home")
+        goHomeSignal.trigger()
+    }
+
+    private fun goingHomeMessage(language: AnnouncementLanguage): String = when (language) {
+        AnnouncementLanguage.INDONESIAN -> "Kembali ke beranda."
+        AnnouncementLanguage.ENGLISH -> "Returning to Home."
     }
 
     /**

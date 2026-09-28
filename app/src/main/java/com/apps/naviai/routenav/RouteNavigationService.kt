@@ -33,6 +33,7 @@ class RouteNavigationService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         val routeName = intent?.getStringExtra(EXTRA_ROUTE_NAME)
+        val listenForVoiceCommands = intent?.getBooleanExtra(EXTRA_LISTEN_FOR_VOICE_COMMANDS, true) ?: true
         if (intent?.action == ACTION_STOP || routeName == null) {
             // Defaults to true (the UI Stop button/notification action's
             // path -- nothing else has spoken a confirmation yet). When
@@ -49,7 +50,7 @@ class RouteNavigationService : Service() {
         }
 
         startForeground(NOTIFICATION_ID, buildNotification(routeName))
-        navigationController.start(routeName)
+        navigationController.start(routeName, listenForVoiceCommands)
         return START_NOT_STICKY
     }
 
@@ -87,12 +88,27 @@ class RouteNavigationService : Service() {
     companion object {
         const val EXTRA_ROUTE_NAME = "route_name"
         const val EXTRA_SPOKEN_CONFIRMATION = "spoken_confirmation"
+        const val EXTRA_LISTEN_FOR_VOICE_COMMANDS = "listen_for_voice_commands"
         const val ACTION_STOP = "com.apps.naviai.routenav.ACTION_STOP"
         private const val CHANNEL_ID = "route_navigation"
         private const val NOTIFICATION_ID = 4201
 
-        fun start(context: Context, routeName: String) {
-            val intent = Intent(context, RouteNavigationService::class.java).putExtra(EXTRA_ROUTE_NAME, routeName)
+        /**
+         * [listenForVoiceCommands] defaults to true (the regular Detection/NavigationScreen path,
+         * where [com.apps.naviai.audio.VoiceCommandManager] is the active listener and
+         * [NavigationController]'s own "stop navigasi" collector is how this feature reaches it).
+         * Pro Mode passes false: it already stopped that same singleton to give
+         * [com.apps.naviai.voiceagent.VoiceAgentClient] exclusive ownership of the mic (see
+         * [com.apps.naviai.ui.viewmodel.ProModeViewModel]'s class doc), and already exposes an
+         * equivalent `stop_navigation` tool through its own conversation -- letting
+         * [NavigationController] reopen the regular mic anyway put two separate capture engines on
+         * the same microphone hardware at once, and NAVI's own spoken turn instructions were getting
+         * picked up by the Voice Agent's mic and replied to as if the user had said them.
+         */
+        fun start(context: Context, routeName: String, listenForVoiceCommands: Boolean = true) {
+            val intent = Intent(context, RouteNavigationService::class.java)
+                .putExtra(EXTRA_ROUTE_NAME, routeName)
+                .putExtra(EXTRA_LISTEN_FOR_VOICE_COMMANDS, listenForVoiceCommands)
             context.startForegroundService(intent)
         }
 

@@ -25,4 +25,16 @@ interface VoiceTranscriber {
     fun setMuted(value: Boolean)
     fun setLanguage(value: AnnouncementLanguage)
     fun setWakeWordBoostEnabled(value: Boolean)
+
+    /**
+     * Registers a callback fired the moment THE USER (not NAVI -- an engine must not report its own
+     * muted-playback audio here) starts speaking, before any transcript exists. Drives
+     * [VoiceCommandManager.userSpeaking], which the rest of the app uses to avoid talking over a
+     * command already in progress -- see that property's doc.
+     *
+     * Default no-op: only [AndroidSpeechRecognizerTranscriber] implements it, because that is where
+     * it matters. [AssemblyAiBatchTranscriber] mutes its own capture for the whole time it is
+     * uploading an utterance, so nothing talks over it mid-command the same way.
+     */
+    fun setUserSpeechListener(listener: (() -> Unit)?) = Unit
 }

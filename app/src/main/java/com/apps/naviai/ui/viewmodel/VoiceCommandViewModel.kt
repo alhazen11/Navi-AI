@@ -19,6 +19,12 @@ class VoiceCommandViewModel @Inject constructor(
 
     val uiState: StateFlow<VoiceCommandUiState> = voiceCommandManager.state
 
+    /** See [VoiceCommandManager.userSpeaking] -- lets the panel say "hearing you" instead of a flat "Listening". */
+    val userSpeaking: StateFlow<Boolean> = voiceCommandManager.userSpeaking
+
+    /** See [VoiceCommandManager.naviSpeaking] -- lets the panel show the mic as paused while NAVI talks, rather than claiming to listen through it. */
+    val naviSpeaking: StateFlow<Boolean> = voiceCommandManager.naviSpeaking
+
     @Volatile private var currentLanguage: AnnouncementLanguage = AnnouncementLanguage.INDONESIAN
     @Volatile private var currentApiKey: String? = null
     @Volatile private var currentOfflineModeEnabled: Boolean = false
